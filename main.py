@@ -19,8 +19,11 @@ GAMMA_API = "https://gamma-api.polymarket.com"
 
 def get_polymarket_markets():
     try:
-        resp = requests.get(f"{GAMMA_API}/markets",
-            params={"active": "true", "limit": 50, "order": "volume", "ascending": "false"}, timeout=15)
+        resp = requests.get(
+            f"{GAMMA_API}/markets",
+            params={"active": "true", "limit": 50, "order": "volume", "ascending": "false"},
+            timeout=15
+        )
         resp.raise_for_status()
         return resp.json()
     except Exception as e:
@@ -31,6 +34,7 @@ def get_polymarket_markets():
 def analyze_markets(markets):
     if not markets:
         return None
+
     summary = []
     for m in markets[:20]:
         try:
@@ -43,71 +47,89 @@ def analyze_markets(markets):
         except Exception:
             continue
 
-    prompt = f"""You are a sharp, conservative prediction market analyst helping a retail investor in Southeast Asia.
-
-Below are the top active Polymarket markets right now, ordered by trading volume:
-
-{json.dumps(summary, indent=2)}
-
-Your job:
-1. Identify any markets where the current odds look clearly WRONG based on your knowledge.
-2. Check whether YES + NO prices sum to approximately $1.00. If they sum to less than $0.97, flag it as arbitrage.
-3. Flag only markets where you are genuinely confident there is an edge. Silence is better than noise.
-
-For every opportunity found, respond in EXACTLY this format:
-
-ALERT: [full market question]
-CURRENT ODDS: YES = $[price] / NO = $[price]
-WHY IT LOOKS MISPRICED: [2 sentences max]
-SUGGESTED PLAY: BUY [YES or NO] at $[price]
-CONFIDENCE: [Low / Medium / High]
----
-
-If NO clear opportunities, respond with ONLY: NO_ALERT"""
+    prompt = (
+        "You are a sharp, conservative prediction market analyst helping a retail investor in Southeast Asia.\n\n"
+        "Below are the top active Polymarket markets right now, ordered by trading volume:\n\n"
+        + json.dumps(summary, indent=2)
+        + "\n\nYour job:\n"
+        "1. Identify any markets where the current odds look clearly WRONG based on your knowledge.\n"
+        "2. Check whether YES + NO prices sum to approximately $1.00. If they sum to less than $0.97, flag it as arbitrage.\n"
+        "3. Flag only markets where you are genuinely confident there is an edge. Silence is better than noise.\n\n"
+        "For every opportunity found, respond in EXACTLY this format:\n\n"
+        "ALERT: [full market question]\n"
+        "CURRENT ODDS: YES = $[price] / NO = $[price]\n"
+        "WHY IT LOOKS MISPRICED: [2 sentences max]\n"
+        "SUGGESTED PLAY: BUY [YES or NO] at $[price]\n"
+        "CONFIDENCE: [Low / Medium / High]\n"
+        "---\n\n"
+        "If NO clear opportunities, respond with ONLY: NO_ALERT"
+    )
 
     try:
-        resp = client.messages.create(model="claude-sonnet-4-20250514", max_tokens=1000,
-            messages=[{"role": "user", "content": prompt}])
+        resp = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=1000,
+            messages=[{"role": "user", "content": prompt}]
+        )
         return resp.content[0].text.strip()
     except Exception as e:
         logger.error(f"Claude API error: {e}")
         return None
 
 
+def build_html(analysis_text):
+    cards_html = ""
+    for block in analysis_text.split("---"):
+        block = block.strip()
+        if not block:
+            continue
+        card_lines = ""
+        for line in block.splitlines():
+            if line.startswith("ALERT:"):
+                val = line.replace("ALERT:", "").strip()
+                card_lines += f'<h3 style="margin:0 0 12px;color:#1a1a2e">{val}</h3>'
+            elif line.startswith("CURRENT ODDS:"):
+                val = line.replace("CURRENT ODDS:", "").strip()
+                card_lines += f'<p style="margin:6px 0"><strong>Odds:</strong> {val}</p>'
+            elif line.startswith("WHY IT LOOKS MISPRICED:"):
+                val = line.replace("WHY IT LOOKS MISPRICED:", "").strip()
+                card_lines += f'<p style="margin:6px 0"><strong>Why:</strong> {val}</p>'
+            elif line.startswith("SUGGESTED PLAY:"):
+                val = line.replace("SUGGESTED PLAY:", "").strip()
+                card_lines += (
+                    f'<p style="margin:6px 0;font-size:16px"><strong>Play:</strong> '
+                    f'<span style="color:#2d6a4f;font-weight:bold">{val}</span></p>'
+                )
+            elif line.startswith("CONFIDENCE:"):
+                level = line.replace("CONFIDENCE:", "").strip()
+                colour = {"High": "#e63946", "Medium": "#f4a261", "Low": "#adb5bd"}.get(level, "#adb5bd")
+                card_lines += (
+                    f'<p style="margin:6px 0"><strong>Confidence:</strong> '
+                    f'<span style="color:{colour};font-weight:bold">{level}</span></p>'
+                )
+        if card_lines:
+            cards_html += (
+                f'<div style="background:#f8f9ff;border-left:4px solid #4361ee;'
+                f'padding:16px;border-radius:6px;margin-bottom:16px">{card_lines}</div>'
+            )
+
+    return (
+        "<html><body style=\"font-family:Arial,sans-serif;max-width:620px;margin:0 auto;padding:24px\">"
+        "<h2 style=\"color:#1a1a2e\">Polymarket Opportunity Alert</h2>"
+        + cards_html
+        + "<a href=\"https://polymarket.com\" style=\"display:inline-block;background:#4361ee;"
+        "color:#fff;padding:12px 28px;text-decoration:none;border-radius:6px;"
+        "font-weight:bold;margin-top:8px\">Open Polymarket</a>"
+        "<p style=\"color:#aaa;font-size:11px;margin-top:24px\">Not financial advice.</p>"
+        "</body></html>"
+    )
+
+
 def send_email(analysis_text):
     try:
-        cards_html = ""
-        for block in analysis_text.split("---"):
-            block = block.strip()
-            if not block:
-                continue
-            lines = block.splitlines()
-            card_lines = ""
-            for line in lines:
-                if line.startswith("ALERT:"):
-                    card_lines += f'<h3 style="margin:0 0 12px;color:#1a1a2e">{line.replace("ALERT:","").strip()}</h3>'
-                elif line.startswith("CURRENT ODDS:"):
-                    card_lines += f'<p style="margin:6px 0"><strong>Odds:</strong> {line.replace("CURRENT ODDS:","").strip()}</p>'
-                elif line.startswith("WHY IT LOOKS MISPRICED:"):
-                    card_lines += f'<p style="margin:6px 0"><strong>Why:</strong> {line.replace("WHY IT LOOKS MISPRICED:","").strip()}</p>'
-                elif line.startswith("SUGGESTED PLAY:"):
-                    play = line.replace("SUGGESTED PLAY:","").strip()
-                    card_lines += f'<p style="margin:6px 0;font-size:16px"><strong>Play:</strong> <span style="color:#2d6a4f;font-weight:bold">{play}</span></p>'
-                elif line.startswith("CONFIDENCE:"):
-                    level = line.replace("CONFIDENCE:","").strip()
-                    colour = {"High":"#e63946","Medium":"#f4a261","Low":"#adb5bd"}.get(level,"#adb5bd")
-                    card_lines += f'<p style="margin:6px 0"><strong>Confidence:</strong> <span style="color:{colour};font-weight:bold">{level}</span></p>'
-            if card_lines:
-                cards_html += f'<div style="background:#f8f9ff;border-left:4px solid #4361ee;padding:16px;border-radius:6px;margin-bottom:16px">{card_lines}</div>'
+        html = build_html(analysis_text)
+        plain = "Polymarket Bot Alert\n\n" + analysis_text + "\n\nGo to https://polymarket.com\nNot financial advice."
 
-        html = f"""<html><body style="font-family:Arial,sans-serif;max-width:620px;margin:0 auto;padding:24px">
-<h2 style="color:#1a1a2e">Polymarket Opportunity Alert</h2>
-{cards_html}
-<a href="https://polymarket.com" style="display:inline-block;background:#4361ee;color:#fff;padding:12px 28px;text-decoration:none;border-radius:6px;font-weight:bold;margin-top:8px">Open Polymarket</a>
-<p style="color:#aaa;font-size:11px;margin-top:24px">Not financial advice. Bot checks every {CHECK_INTERVAL_MINUTES} min.</p>
-</body></html>"""
-
-        # Send via Resend HTTPS API — works on Railway (no SMTP port blocking)
         resp = requests.post(
             "https://api.resend.com/emails",
             headers={
@@ -117,15 +139,15 @@ def send_email(analysis_text):
             json={
                 "from": "Polymarket Bot <onboarding@resend.dev>",
                 "to": [ALERT_EMAIL],
-                "subject": "Polymarket Alert — Opportunity Spotted",
+                "subject": "Polymarket Alert - Opportunity Spotted",
                 "html": html,
-                "text": f"Polymarket Bot Alert\n\n{analysis_text}\n\nGo to https://polymarket.com\nNot financial advice."
+                "text": plain
             },
             timeout=15
         )
 
-        if resp.status_code == 200 or resp.status_code == 201:
-            logger.info("✅ Alert email sent successfully.")
+        if resp.status_code in (200, 201):
+            logger.info("Alert email sent successfully.")
             return True
         else:
             logger.error(f"Resend API error {resp.status_code}: {resp.text}")
@@ -137,7 +159,7 @@ def send_email(analysis_text):
 
 
 def run_cycle():
-    logger.info("── Starting market check cycle ──")
+    logger.info("Starting market check cycle")
     markets = get_polymarket_markets()
     if not markets:
         logger.info("No market data. Skipping.")
@@ -157,9 +179,9 @@ def run_cycle():
 
 
 if __name__ == "__main__":
-    logger.info("🚀 Polymarket Research Bot starting up...")
+    logger.info("Polymarket Research Bot starting up...")
     logger.info(f"Checking every {CHECK_INTERVAL_MINUTES} minutes.")
-    logger.info(f"Alerts → {ALERT_EMAIL}")
+    logger.info(f"Alerts going to {ALERT_EMAIL}")
     run_cycle()
     scheduler = BlockingScheduler(timezone="UTC")
     scheduler.add_job(run_cycle, "interval", minutes=CHECK_INTERVAL_MINUTES)
@@ -167,4 +189,5 @@ if __name__ == "__main__":
     try:
         scheduler.start()
     except (KeyboardInterrupt, SystemExit):
-        logger.in
+        logger.info("Bot stopped.")
+
