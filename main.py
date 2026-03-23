@@ -14,46 +14,55 @@ ALERT_EMAIL            = os.environ["ALERT_EMAIL"]
 CHECK_INTERVAL_MINUTES = int(os.environ.get("CHECK_INTERVAL_MINUTES", "30"))
 
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-GAMMA_API = "https://gamma-api.polymarket.com"
+
+# Myriad Markets API (replaces Polymarket — works from Thailand)
+MYRIAD_API = "https://api-v2.myriadprotocol.com"
 
 
-def get_polymarket_markets():
+def get_markets():
+    """Fetch top active markets from Myriad Markets sorted by volume."""
     try:
         resp = requests.get(
-            f"{GAMMA_API}/markets",
-            params={"active": "true", "limit": 50, "order": "volume", "ascending": "false"},
+            f"{MYRIAD_API}/markets",
+            params={"state": "open", "sort": "volume", "order": "desc", "limit": 50},
             timeout=15
         )
         resp.raise_for_status()
-        return resp.json()
+        data = resp.json()
+        # API returns { data: [...], pagination: {...} }
+        return data.get("data", data) if isinstance(data, dict) else data
     except Exception as e:
-        logger.error(f"Failed to fetch markets: {e}")
+        logger.error(f"Failed to fetch Myriad markets: {e}")
         return []
 
 
 def analyze_markets(markets):
+    """Send market data to Claude and get back an analysis."""
     if not markets:
         return None
 
     summary = []
     for m in markets[:20]:
         try:
+            outcomes = m.get("outcomes", [])
+            outcome_prices = {o.get("title", "?"): o.get("price", "?") for o in outcomes}
             summary.append({
-                "question": m.get("question", "?"),
-                "volume_usd": round(float(m.get("volume", 0)), 2),
-                "outcome_prices": m.get("outcomePrices", []),
-                "closes": m.get("endDate", "?"),
+                "question": m.get("title", "?"),
+                "volume_usd": round(float(m.get("volume", 0) or 0), 2),
+                "outcomes": outcome_prices,
+                "expires": m.get("expiresAt", "?"),
             })
         except Exception:
             continue
 
     prompt = (
-        "You are a sharp, conservative prediction market analyst helping a retail investor in Southeast Asia.\n\n"
-        "Below are the top active Polymarket markets right now, ordered by trading volume:\n\n"
+        "You are a sharp, conservative prediction market analyst helping a retail investor in Thailand.\n\n"
+        "Below are the top active markets on Myriad Markets right now, ordered by trading volume:\n\n"
         + json.dumps(summary, indent=2)
         + "\n\nYour job:\n"
         "1. Identify any markets where the current odds look clearly WRONG based on your knowledge.\n"
-        "2. Check whether YES + NO prices sum to approximately $1.00. If they sum to less than $0.97, flag it as arbitrage.\n"
+        "2. Check whether YES + NO outcome prices sum to approximately $1.00. "
+        "If they sum to less than $0.97, that is a guaranteed-profit arbitrage — flag it immediately.\n"
         "3. Flag only markets where you are genuinely confident there is an edge. Silence is better than noise.\n\n"
         "For every opportunity found, respond in EXACTLY this format:\n\n"
         "ALERT: [full market question]\n"
@@ -62,7 +71,7 @@ def analyze_markets(markets):
         "SUGGESTED PLAY: BUY [YES or NO] at $[price]\n"
         "CONFIDENCE: [Low / Medium / High]\n"
         "---\n\n"
-        "If NO clear opportunities, respond with ONLY: NO_ALERT"
+        "If NO clear opportunities exist, respond with ONLY: NO_ALERT"
     )
 
     try:
@@ -114,21 +123,21 @@ def build_html(analysis_text):
             )
 
     return (
-        "<html><body style=\"font-family:Arial,sans-serif;max-width:620px;margin:0 auto;padding:24px\">"
-        "<h2 style=\"color:#1a1a2e\">Polymarket Opportunity Alert</h2>"
+        '<html><body style="font-family:Arial,sans-serif;max-width:620px;margin:0 auto;padding:24px">'
+        '<h2 style="color:#1a1a2e">Myriad Markets Opportunity Alert</h2>'
         + cards_html
-        + "<a href=\"https://polymarket.com\" style=\"display:inline-block;background:#4361ee;"
-        "color:#fff;padding:12px 28px;text-decoration:none;border-radius:6px;"
-        "font-weight:bold;margin-top:8px\">Open Polymarket</a>"
-        "<p style=\"color:#aaa;font-size:11px;margin-top:24px\">Not financial advice.</p>"
-        "</body></html>"
+        + '<a href="https://myriad.markets" style="display:inline-block;background:#4361ee;'
+        'color:#fff;padding:12px 28px;text-decoration:none;border-radius:6px;'
+        'font-weight:bold;margin-top:8px">Open Myriad Markets</a>'
+        '<p style="color:#aaa;font-size:11px;margin-top:24px">Not financial advice.</p>'
+        '</body></html>'
     )
 
 
 def send_email(analysis_text):
     try:
-        html = build_html(analysis_text)
-        plain = "Polymarket Bot Alert\n\n" + analysis_text + "\n\nGo to https://polymarket.com\nNot financial advice."
+        html  = build_html(analysis_text)
+        plain = "Myriad Markets Alert\n\n" + analysis_text + "\n\nGo to https://myriad.markets\nNot financial advice."
 
         resp = requests.post(
             "https://api.resend.com/emails",
@@ -137,9 +146,9 @@ def send_email(analysis_text):
                 "Content-Type": "application/json"
             },
             json={
-                "from": "Polymarket Bot <onboarding@resend.dev>",
+                "from": "Prediction Bot <onboarding@resend.dev>",
                 "to": [ALERT_EMAIL],
-                "subject": "Polymarket Alert - Opportunity Spotted",
+                "subject": "Myriad Markets Alert - Opportunity Spotted",
                 "html": html,
                 "text": plain
             },
@@ -160,7 +169,7 @@ def send_email(analysis_text):
 
 def run_cycle():
     logger.info("Starting market check cycle")
-    markets = get_polymarket_markets()
+    markets = get_markets()
     if not markets:
         logger.info("No market data. Skipping.")
         return
@@ -179,7 +188,7 @@ def run_cycle():
 
 
 if __name__ == "__main__":
-    logger.info("Polymarket Research Bot starting up...")
+    logger.info("Myriad Markets Research Bot starting up...")
     logger.info(f"Checking every {CHECK_INTERVAL_MINUTES} minutes.")
     logger.info(f"Alerts going to {ALERT_EMAIL}")
     run_cycle()
