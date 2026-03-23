@@ -581,11 +581,56 @@ def run_crypto_cycle():
 def get_myriad_markets():
     try:
         r = requests.get(f"{MYRIAD_API}/markets",
-                         params={"state": "open", "sort": "volume", "order": "desc", "limit": 50},
+                         params={"state": "open", "sort": "volume", "order": "desc", "limit": 100},
                          timeout=15)
         r.raise_for_status()
         data = r.json()
-        return data.get("data", data) if isinstance(data, dict) else data
+        markets = data.get("data", data) if isinstance(data, dict) else data
+
+        now = datetime.now(timezone.utc)
+        filtered = []
+        skip_reasons = {"perpetual": 0, "wrong_network": 0, "expiring_soon": 0, "abstract_keyword": 0}
+
+        for m in markets:
+            # Skip perpetual sentiment markets — no expiresAt means no payout event
+            if not m.get("expiresAt"):
+                skip_reasons["perpetual"] += 1
+                continue
+
+            # Skip markets expiring within 6 hours — not enough time to act
+            try:
+                exp_dt = datetime.fromisoformat(m["expiresAt"].replace("Z", "+00:00"))
+                hours_left = (exp_dt - now).total_seconds() / 3600
+                if hours_left < 6:
+                    skip_reasons["expiring_soon"] += 1
+                    continue
+            except Exception:
+                pass
+
+            # Skip non-BNB-Chain markets (56 = BNB Smart Chain)
+            # Empty networkId is also excluded — unknown chain is untradeable
+            network_id = str(m.get("networkId", ""))
+            if network_id != "56":
+                skip_reasons["wrong_network"] += 1
+                continue
+
+            # Skip markets with "Abstract" in the title — Abstract chain markets
+            # sometimes leak through without a clear networkId
+            title = m.get("title", "").lower()
+            if "abstract" in title and "tge" in title:
+                skip_reasons["abstract_keyword"] += 1
+                continue
+
+            filtered.append(m)
+
+        logger.info(
+            f"Myriad: {len(markets)} total → {len(filtered)} valid "
+            f"(skipped: {skip_reasons['perpetual']} perpetual, "
+            f"{skip_reasons['wrong_network']} wrong network, "
+            f"{skip_reasons['expiring_soon']} expiring soon, "
+            f"{skip_reasons['abstract_keyword']} Abstract chain)"
+        )
+        return filtered
     except Exception as e:
         logger.error(f"Myriad fetch error: {e}")
         return []
@@ -607,22 +652,37 @@ def analyze_myriad(markets):
     if not markets:
         return None
     summary = []
+    slug_map = {}  # question title → direct URL
     for m in markets[:20]:
         try:
             outcomes = {o.get("title", "?"): o.get("price", "?") for o in m.get("outcomes", [])}
-            summary.append({"question": m.get("title", "?"),
-                            "volume_usd": round(float(m.get("volume", 0) or 0), 2),
-                            "outcomes": outcomes, "expires": m.get("expiresAt", "?")})
+            title = m.get("title", "?")
+            slug  = m.get("slug", "")
+            mkt_id = str(m.get("id", ""))
+            # Build direct URL — use slug if available, else market ID
+            direct_url = f"https://myriad.markets/markets/{slug}" if slug else f"https://myriad.markets/markets/{mkt_id}"
+            slug_map[title] = direct_url
+            summary.append({
+                "question":   title,
+                "direct_url": direct_url,
+                "volume_usd": round(float(m.get("volume", 0) or 0), 2),
+                "outcomes":   outcomes,
+                "expires":    m.get("expiresAt", "?"),
+            })
         except Exception:
             continue
+
     prompt = (
         "You are a sharp, conservative prediction market analyst.\n\n"
-        "Top active Myriad Markets right now:\n\n"
+        "Top active Myriad Markets on BNB Chain right now (perpetual markets excluded):\n\n"
         + json.dumps(summary, indent=2)
         + "\n\nFind markets where odds look clearly wrong, or YES+NO < $0.97 (arbitrage).\n"
-        "Only flag genuine edges. Silence is better than noise.\n\n"
+        "Only flag genuine edges. Silence is better than noise.\n"
+        "IMPORTANT: The 'direct_url' field for each market is the exact URL to trade it — "
+        "include it in your response using the MARKET URL field below.\n\n"
         "For each opportunity use EXACTLY this format:\n\n"
         "ALERT: [market question]\n"
+        "MARKET URL: [direct_url from the data above]\n"
         "CURRENT ODDS: YES = $[price] / NO = $[price]\n"
         "WHY IT LOOKS MISPRICED: [2 sentences max]\n"
         "SUGGESTED PLAY: BUY [YES or NO] at $[price]\n"
@@ -630,6 +690,13 @@ def analyze_myriad(markets):
         "---\n\n"
         "If nothing found respond ONLY with: NO_ALERT"
     )
+    try:
+        resp = client.messages.create(model="claude-sonnet-4-20250514", max_tokens=1000,
+                                      messages=[{"role": "user", "content": prompt}])
+        return resp.content[0].text.strip()
+    except Exception as e:
+        logger.error(f"Claude error (Myriad): {e}")
+        return None
     try:
         resp = client.messages.create(model="claude-sonnet-4-20250514", max_tokens=1000,
                                       messages=[{"role": "user", "content": prompt}])
