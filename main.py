@@ -1,19 +1,15 @@
 import os
-import smtplib
 import json
 import requests
 import anthropic
 import logging
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
 from apscheduler.schedulers.blocking import BlockingScheduler
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
 ANTHROPIC_API_KEY      = os.environ["ANTHROPIC_API_KEY"]
-GMAIL_ADDRESS          = os.environ["GMAIL_ADDRESS"]
-GMAIL_APP_PASSWORD     = os.environ["GMAIL_APP_PASSWORD"]
+RESEND_API_KEY         = os.environ["RESEND_API_KEY"]
 ALERT_EMAIL            = os.environ["ALERT_EMAIL"]
 CHECK_INTERVAL_MINUTES = int(os.environ.get("CHECK_INTERVAL_MINUTES", "30"))
 
@@ -80,13 +76,6 @@ If NO clear opportunities, respond with ONLY: NO_ALERT"""
 
 def send_email(analysis_text):
     try:
-        msg = MIMEMultipart("alternative")
-        msg["Subject"] = "Polymarket Alert - Opportunity Spotted"
-        msg["From"] = GMAIL_ADDRESS
-        msg["To"] = ALERT_EMAIL
-
-        plain = f"Polymarket Bot Alert\n\n{analysis_text}\n\nGo to https://polymarket.com\nNot financial advice."
-
         cards_html = ""
         for block in analysis_text.split("---"):
             block = block.strip()
@@ -118,18 +107,30 @@ def send_email(analysis_text):
 <p style="color:#aaa;font-size:11px;margin-top:24px">Not financial advice. Bot checks every {CHECK_INTERVAL_MINUTES} min.</p>
 </body></html>"""
 
-        msg.attach(MIMEText(plain, "plain"))
-        msg.attach(MIMEText(html, "html"))
+        # Send via Resend HTTPS API — works on Railway (no SMTP port blocking)
+        resp = requests.post(
+            "https://api.resend.com/emails",
+            headers={
+                "Authorization": f"Bearer {RESEND_API_KEY}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "from": "Polymarket Bot <onboarding@resend.dev>",
+                "to": [ALERT_EMAIL],
+                "subject": "Polymarket Alert — Opportunity Spotted",
+                "html": html,
+                "text": f"Polymarket Bot Alert\n\n{analysis_text}\n\nGo to https://polymarket.com\nNot financial advice."
+            },
+            timeout=15
+        )
 
-        # PORT 587 + STARTTLS — works on Railway (port 465 is blocked)
-        with smtplib.SMTP("smtp.gmail.com", 587) as server:
-            server.ehlo()
-            server.starttls()
-            server.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
-            server.sendmail(GMAIL_ADDRESS, ALERT_EMAIL, msg.as_string())
+        if resp.status_code == 200 or resp.status_code == 201:
+            logger.info("✅ Alert email sent successfully.")
+            return True
+        else:
+            logger.error(f"Resend API error {resp.status_code}: {resp.text}")
+            return False
 
-        logger.info("✅ Alert email sent successfully.")
-        return True
     except Exception as e:
         logger.error(f"Failed to send email: {e}")
         return False
@@ -166,4 +167,4 @@ if __name__ == "__main__":
     try:
         scheduler.start()
     except (KeyboardInterrupt, SystemExit):
-        logger.info("Bot stopped.")
+        logger.in
