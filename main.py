@@ -403,25 +403,45 @@ def get_all_usdt_pairs():
 
 def prefilter_pairs(pairs, top_n=20):
     """
-    Score every pair and return the top_n most interesting ones for Claude to analyse.
-    Scoring logic surfaces: high volume movers, oversold bounces, overbought exhaustion.
+    Score every pair and return the top_n most interesting for Claude.
+    Three buckets: big movers, high volume gainers, biggest losers (oversold bounce candidates).
+    Returns a balanced mix rather than just the biggest single-day movers.
     """
+    import math
+
+    # Bucket 1: biggest movers by volume-weighted score (top 8)
     scored = []
     for t in pairs:
         try:
             change = abs(float(t.get("priceChangePercent", 0)))
             volume = float(t.get("quoteVolume", 0))
-            # Score = size of move * log of volume (rewards big moves on liquid pairs)
-            import math
-            score = change * math.log10(max(volume, 1))
+            score  = change * math.log10(max(volume, 1))
             scored.append((score, t))
         except Exception:
             continue
-
     scored.sort(key=lambda x: x[0], reverse=True)
-    top = [t for _, t in scored[:top_n]]
-    logger.info(f"Pre-filtered to top {len(top)} pairs for Claude analysis")
-    return top
+    top_movers = [t for _, t in scored[:8]]
+
+    # Bucket 2: biggest 24h gainers (momentum — top 6)
+    gainers = sorted(pairs, key=lambda t: float(t.get("priceChangePercent", 0)), reverse=True)[:6]
+
+    # Bucket 3: biggest 24h losers (oversold bounce candidates — top 6)
+    losers = sorted(pairs, key=lambda t: float(t.get("priceChangePercent", 0)))[:6]
+
+    # Combine and deduplicate by symbol
+    seen    = set()
+    result  = []
+    for t in top_movers + gainers + losers:
+        sym = t.get("symbol", "")
+        if sym not in seen:
+            seen.add(sym)
+            result.append(t)
+        if len(result) >= top_n:
+            break
+
+    logger.info(f"Pre-filtered to {len(result)} pairs ({len([t for t in gainers if t not in top_movers])} gainers, "
+                f"{len([t for t in losers if t not in top_movers and t not in gainers])} losers, rest movers)")
+    return result[:top_n]
 
 def get_crypto_candles(symbol):
     """Fetch RSI and SMAs for a single symbol using daily candles."""
@@ -431,61 +451,85 @@ def get_crypto_candles(symbol):
                          params={"symbol": symbol, "interval": "1d", "limit": 220},
                          timeout=10)
         candles = r.json()
-        if not isinstance(candles, list) or len(candles) < 20:
+        if not isinstance(candles, list) or len(candles) < 14:
             return result
         closes = [float(c[4]) for c in candles]
-        result["rsi_14"]  = calculate_rsi(closes[-30:])
-        result["sma_50"]  = round(sum(closes[-50:]) / 50, 2) if len(closes) >= 50 else None
-        result["sma_200"] = round(sum(closes[-200:]) / 200, 2) if len(closes) >= 200 else None
+        result["rsi_14"] = calculate_rsi(closes)
+        result["sma_50"] = round(sum(closes[-50:]) / 50, 4) if len(closes) >= 50 else None
+        result["sma_200"]= round(sum(closes[-200:]) / 200, 4) if len(closes) >= 200 else None
     except Exception as e:
         logger.error(f"Candles error {symbol}: {e}")
     return result
 
 def build_crypto_summary(ticker_data):
     """Combine 24hr ticker + candle data into one clean dict for Claude."""
-    symbol = ticker_data.get("symbol", "")
-    price  = float(ticker_data.get("lastPrice", 0))
+    symbol  = ticker_data.get("symbol", "")
+    price   = float(ticker_data.get("lastPrice", 0))
     candles = get_crypto_candles(symbol)
     sma50   = candles.get("sma_50")
     sma200  = candles.get("sma_200")
+    rsi     = candles.get("rsi_14")
     return {
-        "symbol":        symbol,
-        "price":         price,
+        "symbol":         symbol,
+        "price":          price,
         "change_24h_pct": round(float(ticker_data.get("priceChangePercent", 0)), 2),
-        "volume_usdt":   round(float(ticker_data.get("quoteVolume", 0))),
-        "high_24h":      float(ticker_data.get("highPrice", 0)),
-        "low_24h":       float(ticker_data.get("lowPrice", 0)),
-        "rsi_14":        candles.get("rsi_14"),
-        "sma_50":        sma50,
-        "sma_200":       sma200,
-        "vs_sma50":      ("above" if price > sma50 else "below") if sma50 else "unknown",
-        "vs_sma200":     ("above" if price > sma200 else "below") if sma200 else "unknown",
+        "volume_usdt":    round(float(ticker_data.get("quoteVolume", 0))),
+        "high_24h":       float(ticker_data.get("highPrice", 0)),
+        "low_24h":        float(ticker_data.get("lowPrice", 0)),
+        "rsi_14":         rsi,
+        "rsi_signal":     ("OVERSOLD" if rsi and rsi < 30 else "OVERBOUGHT" if rsi and rsi > 70 else "NEUTRAL") if rsi else "NO_DATA",
+        "sma_50":         sma50,
+        "sma_200":        sma200,
+        "vs_sma50":       ("above" if price > sma50 else "below") if sma50 else "insufficient_history",
+        "vs_sma200":      ("above" if price > sma200 else "below") if sma200 else "insufficient_history",
     }
 
 def analyze_crypto(crypto_data_list):
+    # Pre-screen: pull out any that already have clear RSI signals to highlight them
+    oversold  = [d["symbol"] for d in crypto_data_list if d.get("rsi_14") and d["rsi_14"] < 32]
+    overbought= [d["symbol"] for d in crypto_data_list if d.get("rsi_14") and d["rsi_14"] > 68]
+
+    hint = ""
+    if oversold:
+        hint += f"\nNOTE: These symbols have RSI below 32 (oversold territory): {', '.join(oversold)}"
+    if overbought:
+        hint += f"\nNOTE: These symbols have RSI above 68 (overbought territory): {', '.join(overbought)}"
+
     prompt = (
-        "You are a sharp crypto analyst scanning the entire Binance market for a retail trader.\n\n"
-        "Below are the top movers across ALL USDT pairs on Binance right now, "
-        "pre-filtered by volume and price movement:\n\n"
+        "You are a crypto trading analyst scanning Binance for a retail trader.\n\n"
+        "Below is market data for the top movers, biggest gainers, and biggest losers "
+        "across all USDT pairs on Binance right now:\n\n"
         + json.dumps(crypto_data_list, indent=2)
-        + "\n\nRSI GUIDE: Below 30 = oversold (potential BUY). Above 70 = overbought (potential SELL).\n"
-        "SMA GUIDE: Price above SMA50 and SMA200 = uptrend. Below both = downtrend.\n"
-        "24h change > +8% with high volume = strong momentum.\n"
-        "24h change < -10% with RSI < 35 = potential oversold bounce.\n\n"
-        "Only alert when MULTIPLE signals agree. Be conservative — crypto is volatile.\n"
-        "Never alert on Low confidence. Max 3 alerts per cycle.\n\n"
-        "For each genuine opportunity use EXACTLY this format:\n\n"
+        + hint
+        + "\n\nSIGNAL CRITERIA — alert if ANY of these conditions are met:\n"
+        "• RSI below 32: oversold — potential BUY opportunity\n"
+        "• RSI above 68: overbought — potential SELL/avoid signal\n"
+        "• 24h gain > +7% with volume > $5M USDT: momentum BUY\n"
+        "• 24h loss > -8% with RSI below 40: oversold bounce BUY candidate\n"
+        "• Price clearly above both SMA50 and SMA200 in uptrend: bullish confirmation\n\n"
+        "NOTE: Many newer coins won't have SMA200 data — that's fine, use RSI and 24h data.\n"
+        "Do NOT stay silent just because SMA200 is missing.\n"
+        "Max 3 alerts per cycle. Skip Low confidence.\n\n"
+        "For each opportunity use EXACTLY this format:\n\n"
         "ALERT: [SYMBOL]\n"
         "PRICE: $[current price]\n"
-        "SIGNAL: [BUY / SELL]\n"
-        "RSI: [value] — [interpretation]\n"
-        "TREND: [price vs SMA50/200 interpretation]\n"
-        "REASONING: [2-3 sentences combining all signals]\n"
-        "SUGGESTED ENTRY: $[price range]\n"
+        "SIGNAL: [BUY / SELL / AVOID]\n"
+        "RSI: [value] — [OVERSOLD / NEUTRAL / OVERBOUGHT]\n"
+        "24H CHANGE: [value]%\n"
+        "TREND: [one sentence on SMA or momentum situation]\n"
+        "REASONING: [2 sentences on why this is worth acting on]\n"
+        "SUGGESTED ENTRY: $[price or range]\n"
         "CONFIDENCE: [Medium / High]\n"
         "---\n\n"
-        "If nothing convincing across the whole market, respond ONLY with: NO_ALERT"
+        "If genuinely nothing meets the criteria, respond ONLY with: NO_ALERT"
     )
+    try:
+        resp = client.messages.create(model="claude-sonnet-4-20250514", max_tokens=1500,
+                                      messages=[{"role": "user", "content": prompt}])
+        return resp.content[0].text.strip()
+    except Exception as e:
+        logger.error(f"Claude error (crypto): {e}")
+        return None
     try:
         resp = client.messages.create(model="claude-sonnet-4-20250514", max_tokens=1500,
                                       messages=[{"role": "user", "content": prompt}])
@@ -971,20 +1015,60 @@ def send_crypto_email(analysis):
         "PRICE:": '<p style="margin:5px 0"><strong>Price:</strong> {val}</p>',
         "SIGNAL:": '<p style="margin:8px 0;font-size:18px;font-weight:bold;color:#f7931a">▶ {val}</p>',
         "RSI:": '<p style="margin:5px 0"><strong>RSI:</strong> {val}</p>',
+        "24H CHANGE:": '<p style="margin:5px 0"><strong>24h Change:</strong> {val}</p>',
         "TREND:": '<p style="margin:5px 0"><strong>Trend:</strong> {val}</p>',
         "REASONING:": '<p style="margin:5px 0"><strong>Why:</strong> {val}</p>',
         "SUGGESTED ENTRY:": '<p style="margin:5px 0"><strong>Entry:</strong> {val}</p>',
         "CONFIDENCE:": '<p style="margin:5px 0"><strong>Confidence:</strong> {val}</p>',
     }
-    cards = _parse_blocks(analysis, field_map, "#f7931a", log_url, "ticker")
+
+    # Build cards manually so we can add a direct Binance trade link per symbol
+    cards = ""
+    for block in analysis.split("---"):
+        block = block.strip()
+        if not block:
+            continue
+        inner  = ""
+        symbol = ""
+        for line in block.splitlines():
+            matched = False
+            for prefix, template in field_map.items():
+                if line.startswith(prefix):
+                    val = line.replace(prefix, "").strip()
+                    if prefix == "ALERT:":
+                        symbol = val.replace("USDT", "").strip()
+                    inner += template.format(val=val)
+                    matched = True
+                    break
+
+        if inner:
+            # Direct link to the exact trading pair on Binance
+            binance_url = f"https://www.binance.com/en/trade/{symbol}_USDT" if symbol else "https://www.binance.com/en/trade"
+            trade_btn = (
+                f'<a href="{binance_url}" style="display:inline-block;background:#f7931a;'
+                f'color:#fff;padding:10px 20px;text-decoration:none;border-radius:6px;'
+                f'font-size:14px;font-weight:bold;margin-top:12px;margin-right:8px">'
+                f'▶ Trade on Binance</a>'
+            )
+            log_btn = ""
+            if log_url:
+                log_btn = (
+                    f'<a href="{log_url}/log?ticker={symbol}USDT" style="display:inline-block;'
+                    f'background:#2d6a4f;color:#fff;padding:10px 20px;text-decoration:none;'
+                    f'border-radius:6px;font-size:14px;font-weight:bold;margin-top:12px">'
+                    f'📋 Log Trade</a>'
+                )
+            cards += (
+                f'<div style="background:#fff8f0;border-left:4px solid #f7931a;'
+                f'padding:16px;border-radius:6px;margin-bottom:16px">'
+                f'{inner}{trade_btn}{log_btn}</div>'
+            )
+
     html = (
         '<html><body style="font-family:Arial,sans-serif;max-width:620px;margin:0 auto;padding:24px">'
         '<h2 style="color:#1a1a2e">₿ Crypto Signal Alert</h2>'
-        '<p style="color:#666;font-size:13px;margin-bottom:20px">Technical analysis via Binance data</p>'
+        '<p style="color:#666;font-size:13px;margin-bottom:20px">Scanning all Binance USDT pairs — RSI + momentum analysis</p>'
         + cards +
-        '<a href="https://www.binance.com/en/trade" style="display:inline-block;background:#f7931a;'
-        'color:#fff;padding:12px 28px;text-decoration:none;border-radius:6px;'
-        'font-weight:bold;margin-top:8px">Open Binance</a>'
         '<p style="color:#aaa;font-size:11px;margin-top:24px">Not financial advice. '
         'Crypto is highly volatile — only trade what you can afford to lose.</p>'
         '</body></html>'
