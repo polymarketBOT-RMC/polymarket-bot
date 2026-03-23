@@ -31,8 +31,7 @@ CRYPTO_SL_PCT        = float(os.environ.get("CRYPTO_SL_PCT", "10"))
 
 STOCK_WATCHLIST  = [t.strip().upper() for t in
                     os.environ.get("WATCHLIST", "AAPL,TSLA,NVDA,MSFT,AMZN,GOOGL").split(",")]
-CRYPTO_WATCHLIST = [t.strip().upper() for t in
-                    os.environ.get("CRYPTO_WATCHLIST", "BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT,XRPUSDT").split(",")]
+CRYPTO_TOP_N     = int(os.environ.get("CRYPTO_TOP_N", "20"))  # how many pairs to send Claude after filtering
 
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 app    = Flask(__name__)
@@ -282,52 +281,99 @@ def calculate_rsi(closes, period=14):
     rs = avg_gain / avg_loss
     return round(100 - (100 / (1 + rs)), 2)
 
-def get_crypto_data(symbol):
-    result = {"symbol": symbol}
+def get_all_usdt_pairs():
+    """Fetch ALL active USDT trading pairs from Binance in one call."""
     try:
-        # Current price
-        r = requests.get(f"{BINANCE_BASE}/ticker/24hr",
-                         params={"symbol": symbol}, timeout=10)
-        d = r.json()
-        result["price"]      = float(d.get("lastPrice", 0))
-        result["change_pct"] = float(d.get("priceChangePercent", 0))
-        result["volume_usdt"]= round(float(d.get("quoteVolume", 0)), 0)
-        result["high_24h"]   = float(d.get("highPrice", 0))
-        result["low_24h"]    = float(d.get("lowPrice", 0))
+        r = requests.get(f"{BINANCE_BASE}/ticker/24hr", timeout=20)
+        all_tickers = r.json()
+        # Keep only USDT pairs with meaningful volume (>$500k/day)
+        pairs = [
+            t for t in all_tickers
+            if t.get("symbol", "").endswith("USDT")
+            and float(t.get("quoteVolume", 0)) > 500000
+            and float(t.get("lastPrice", 0)) > 0
+        ]
+        logger.info(f"Found {len(pairs)} active USDT pairs with >$500k daily volume")
+        return pairs
     except Exception as e:
-        logger.error(f"Binance price error {symbol}: {e}")
+        logger.error(f"Failed to fetch all pairs: {e}")
+        return []
 
+def prefilter_pairs(pairs, top_n=20):
+    """
+    Score every pair and return the top_n most interesting ones for Claude to analyse.
+    Scoring logic surfaces: high volume movers, oversold bounces, overbought exhaustion.
+    """
+    scored = []
+    for t in pairs:
+        try:
+            change = abs(float(t.get("priceChangePercent", 0)))
+            volume = float(t.get("quoteVolume", 0))
+            # Score = size of move * log of volume (rewards big moves on liquid pairs)
+            import math
+            score = change * math.log10(max(volume, 1))
+            scored.append((score, t))
+        except Exception:
+            continue
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    top = [t for _, t in scored[:top_n]]
+    logger.info(f"Pre-filtered to top {len(top)} pairs for Claude analysis")
+    return top
+
+def get_crypto_candles(symbol):
+    """Fetch RSI and SMAs for a single symbol using daily candles."""
+    result = {}
     try:
-        # OHLCV candles for RSI + SMA
         r = requests.get(f"{BINANCE_BASE}/klines",
                          params={"symbol": symbol, "interval": "1d", "limit": 220},
                          timeout=10)
         candles = r.json()
+        if not isinstance(candles, list) or len(candles) < 20:
+            return result
         closes = [float(c[4]) for c in candles]
-
         result["rsi_14"]  = calculate_rsi(closes[-30:])
-        result["sma_50"]  = round(sum(closes[-50:]) / 50, 4) if len(closes) >= 50 else None
-        result["sma_200"] = round(sum(closes[-200:]) / 200, 4) if len(closes) >= 200 else None
-        result["price_vs_sma50"]  = "above" if result.get("price", 0) > (result["sma_50"] or 0) else "below"
-        result["price_vs_sma200"] = "above" if result.get("price", 0) > (result["sma_200"] or 0) else "below"
+        result["sma_50"]  = round(sum(closes[-50:]) / 50, 2) if len(closes) >= 50 else None
+        result["sma_200"] = round(sum(closes[-200:]) / 200, 2) if len(closes) >= 200 else None
     except Exception as e:
-        logger.error(f"Binance candles error {symbol}: {e}")
-
+        logger.error(f"Candles error {symbol}: {e}")
     return result
+
+def build_crypto_summary(ticker_data):
+    """Combine 24hr ticker + candle data into one clean dict for Claude."""
+    symbol = ticker_data.get("symbol", "")
+    price  = float(ticker_data.get("lastPrice", 0))
+    candles = get_crypto_candles(symbol)
+    sma50   = candles.get("sma_50")
+    sma200  = candles.get("sma_200")
+    return {
+        "symbol":        symbol,
+        "price":         price,
+        "change_24h_pct": round(float(ticker_data.get("priceChangePercent", 0)), 2),
+        "volume_usdt":   round(float(ticker_data.get("quoteVolume", 0))),
+        "high_24h":      float(ticker_data.get("highPrice", 0)),
+        "low_24h":       float(ticker_data.get("lowPrice", 0)),
+        "rsi_14":        candles.get("rsi_14"),
+        "sma_50":        sma50,
+        "sma_200":       sma200,
+        "vs_sma50":      ("above" if price > sma50 else "below") if sma50 else "unknown",
+        "vs_sma200":     ("above" if price > sma200 else "below") if sma200 else "unknown",
+    }
 
 def analyze_crypto(crypto_data_list):
     prompt = (
-        "You are a sharp crypto analyst helping a retail trader.\n\n"
-        "Current Binance market data:\n\n"
+        "You are a sharp crypto analyst scanning the entire Binance market for a retail trader.\n\n"
+        "Below are the top movers across ALL USDT pairs on Binance right now, "
+        "pre-filtered by volume and price movement:\n\n"
         + json.dumps(crypto_data_list, indent=2)
-        + "\n\nRSI GUIDE: Below 30 = oversold (BUY signal). Above 70 = overbought (SELL signal).\n"
-        "SMA GUIDE: Price above both SMA50 and SMA200 = bullish. Below both = bearish.\n"
-        "24h change > +5% with high volume = momentum signal.\n"
-        "24h change < -8% = potential oversold bounce.\n\n"
-        "Only alert when MULTIPLE signals agree. Crypto is volatile — be conservative.\n"
-        "Never alert on Low confidence signals.\n\n"
+        + "\n\nRSI GUIDE: Below 30 = oversold (potential BUY). Above 70 = overbought (potential SELL).\n"
+        "SMA GUIDE: Price above SMA50 and SMA200 = uptrend. Below both = downtrend.\n"
+        "24h change > +8% with high volume = strong momentum.\n"
+        "24h change < -10% with RSI < 35 = potential oversold bounce.\n\n"
+        "Only alert when MULTIPLE signals agree. Be conservative — crypto is volatile.\n"
+        "Never alert on Low confidence. Max 3 alerts per cycle.\n\n"
         "For each genuine opportunity use EXACTLY this format:\n\n"
-        "ALERT: [SYMBOL] (e.g. BTCUSDT)\n"
+        "ALERT: [SYMBOL]\n"
         "PRICE: $[current price]\n"
         "SIGNAL: [BUY / SELL]\n"
         "RSI: [value] — [interpretation]\n"
@@ -336,10 +382,10 @@ def analyze_crypto(crypto_data_list):
         "SUGGESTED ENTRY: $[price range]\n"
         "CONFIDENCE: [Medium / High]\n"
         "---\n\n"
-        "If nothing convincing, respond ONLY with: NO_ALERT"
+        "If nothing convincing across the whole market, respond ONLY with: NO_ALERT"
     )
     try:
-        resp = client.messages.create(model="claude-sonnet-4-20250514", max_tokens=1200,
+        resp = client.messages.create(model="claude-sonnet-4-20250514", max_tokens=1500,
                                       messages=[{"role": "user", "content": prompt}])
         return resp.content[0].text.strip()
     except Exception as e:
@@ -357,8 +403,13 @@ def check_crypto_positions():
         symbol = pos.get("ticker", "")
         if not symbol:
             continue
-        data = get_crypto_data(symbol)
-        current = data.get("price", 0)
+        # Use single ticker endpoint for position monitoring (faster)
+        try:
+            r = requests.get(f"{BINANCE_BASE}/ticker/price",
+                             params={"symbol": symbol}, timeout=10)
+            current = float(r.json().get("price", 0))
+        except Exception:
+            continue
         if not current:
             continue
 
@@ -397,11 +448,24 @@ def check_crypto_positions():
         send_sell_email(alerts)
 
 def run_crypto_cycle():
-    logger.info("── Crypto cycle starting ──")
+    logger.info("── Crypto cycle starting — scanning ALL Binance USDT pairs ──")
     check_crypto_positions()
-    logger.info(f"Scanning crypto watchlist: {CRYPTO_WATCHLIST}")
-    all_data = [get_crypto_data(symbol) for symbol in CRYPTO_WATCHLIST]
-    analysis = analyze_crypto(all_data)
+
+    # Step 1: fetch all pairs in one API call
+    all_pairs = get_all_usdt_pairs()
+    if not all_pairs:
+        logger.info("No Binance data. Skipping.")
+        return
+
+    # Step 2: pre-filter to top movers
+    top_pairs = prefilter_pairs(all_pairs, top_n=CRYPTO_TOP_N)
+
+    # Step 3: enrich with RSI + SMA (one candle call per pair)
+    logger.info(f"Fetching candle data for {len(top_pairs)} pairs...")
+    summaries = [build_crypto_summary(t) for t in top_pairs]
+
+    # Step 4: send to Claude
+    analysis = analyze_crypto(summaries)
     if not analysis or analysis == "NO_ALERT":
         logger.info("No crypto signals this cycle.")
         return
@@ -815,7 +879,7 @@ if __name__ == "__main__":
     logger.info(f"Myriad + Crypto: every {CHECK_INTERVAL_MINUTES} minutes")
     logger.info(f"Stocks: daily at {STOCK_SCAN_HOUR_UTC}:00 UTC")
     logger.info(f"Stock watchlist:  {STOCK_WATCHLIST}")
-    logger.info(f"Crypto watchlist: {CRYPTO_WATCHLIST}")
+    logger.info(f"Crypto: scanning ALL Binance USDT pairs, top {CRYPTO_TOP_N} sent to Claude")
 
     threading.Thread(target=run_flask, daemon=True).start()
     logger.info("Trade log web form live.")
@@ -835,4 +899,3 @@ if __name__ == "__main__":
         scheduler.start()
     except (KeyboardInterrupt, SystemExit):
         logger.info("Bot stopped.")
-
