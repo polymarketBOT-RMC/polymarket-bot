@@ -17,6 +17,7 @@ RESEND_API_KEY         = os.environ["RESEND_API_KEY"]
 ALERT_EMAIL            = os.environ["ALERT_EMAIL"]
 JSONBIN_API_KEY        = os.environ["JSONBIN_API_KEY"]
 JSONBIN_BIN_ID         = os.environ["JSONBIN_BIN_ID"]
+JSONBIN_HISTORY_BIN_ID = os.environ["JSONBIN_HISTORY_BIN_ID"]
 ALPHAVANTAGE_API_KEY   = os.environ["ALPHAVANTAGE_API_KEY"]
 CHECK_INTERVAL_MINUTES = int(os.environ.get("CHECK_INTERVAL_MINUTES", "30"))
 STOCK_SCAN_HOUR_UTC    = int(os.environ.get("STOCK_SCAN_HOUR_UTC", "23"))  # 06:00 Bangkok
@@ -39,8 +40,9 @@ app    = Flask(__name__)
 MYRIAD_API      = "https://api-v2.myriadprotocol.com"
 AV_BASE         = "https://www.alphavantage.co/query"
 BINANCE_BASE    = "https://api.binance.com/api/v3"
-JSONBIN_URL     = f"https://api.jsonbin.io/v3/b/{JSONBIN_BIN_ID}"
-JSONBIN_HEADERS = {"X-Master-Key": JSONBIN_API_KEY, "Content-Type": "application/json"}
+JSONBIN_URL         = f"https://api.jsonbin.io/v3/b/{JSONBIN_BIN_ID}"
+JSONBIN_HISTORY_URL = f"https://api.jsonbin.io/v3/b/{JSONBIN_HISTORY_BIN_ID}"
+JSONBIN_HEADERS     = {"X-Master-Key": JSONBIN_API_KEY, "Content-Type": "application/json"}
 
 # ── HTML form ───────────────────────────────────────────────────────────────
 FORM_HTML = """
@@ -88,6 +90,17 @@ FORM_HTML = """
     .pos-detail { color: #555; font-size: 13px; margin-top: 5px; }
     .del-btn { background: none; border: none; color: #e63946; cursor: pointer;
                font-size: 12px; font-weight: bold; margin-top: 8px; padding: 0; width: auto; }
+    .close-btn { background: none; border: none; color: #2d6a4f; cursor: pointer;
+                 font-size: 12px; font-weight: bold; margin-top: 8px; margin-right: 12px;
+                 padding: 0; width: auto; }
+    .close-form { display: none; margin-top: 10px; background: #fff;
+                  border: 1px solid #ddd; border-radius: 8px; padding: 12px; }
+    .close-form input { margin-bottom: 8px; }
+    .close-form button.confirm { background: #2d6a4f; color: white; border: none;
+                                  padding: 8px 16px; border-radius: 6px; font-size: 13px;
+                                  font-weight: bold; cursor: pointer; width: auto; }
+    .close-success { background: #d4edda; border: 1px solid #c3e6cb; color: #155724;
+                     padding: 14px; border-radius: 8px; margin-bottom: 18px; font-size: 14px; }
     .section { display: none; }
     .section.active { display: block; }
     h3 { color: #1a1a2e; margin-bottom: 14px; }
@@ -98,6 +111,10 @@ FORM_HTML = """
       document.querySelectorAll('.section').forEach(s => s.classList.remove('active'));
       document.getElementById('tab-' + tab).classList.add('active');
       document.getElementById('sec-' + tab).classList.add('active');
+    }
+    function toggleClose(id) {
+      var f = document.getElementById('close-form-' + id);
+      f.style.display = f.style.display === 'none' ? 'block' : 'none';
     }
   </script>
 </head>
@@ -160,6 +177,12 @@ FORM_HTML = """
     </div>
   </div>
 
+  {% if close_success %}
+  <div class="card">
+    <div class="close-success">✅ Trade closed and recorded in your history. P&L calculated.</div>
+  </div>
+  {% endif %}
+
   {% if positions %}
   <div class="card">
     <h3>Open Positions ({{ positions|length }})</h3>
@@ -178,10 +201,19 @@ FORM_HTML = """
       <div class="pos-detail">
         {{ pos.side }} @ ${{ pos.entry_price }} &nbsp;|&nbsp; {{ pos.date }}
       </div>
+      <button type="button" class="close-btn" onclick="toggleClose('{{ pos.id }}')">✓ Close Trade</button>
       <form method="POST" action="/delete" style="display:inline">
         <input type="hidden" name="pos_id" value="{{ pos.id }}">
         <button type="submit" class="del-btn">✕ Remove</button>
       </form>
+      <div class="close-form" id="close-form-{{ pos.id }}">
+        <form method="POST" action="/close">
+          <input type="hidden" name="pos_id" value="{{ pos.id }}">
+          <label>Exit Price (what did you sell at?)</label>
+          <input type="number" name="exit_price" step="0.0001" min="0.0001" placeholder="e.g. 0.75" required>
+          <button type="submit" class="confirm">Record Sale & Calculate P&L</button>
+        </form>
+      </div>
     </div>
     {% endfor %}
   </div>
@@ -209,6 +241,56 @@ def save_positions(positions):
     except Exception as e:
         logger.error(f"Save positions error: {e}")
         return False
+
+def load_history():
+    try:
+        r = requests.get(JSONBIN_HISTORY_URL, headers=JSONBIN_HEADERS, timeout=10)
+        if r.status_code == 200:
+            return r.json().get("record", {}).get("trades", [])
+    except Exception as e:
+        logger.error(f"Load history error: {e}")
+    return []
+
+def save_history(trades):
+    try:
+        r = requests.put(JSONBIN_HISTORY_URL, headers=JSONBIN_HEADERS,
+                         json={"trades": trades}, timeout=10)
+        return r.status_code == 200
+    except Exception as e:
+        logger.error(f"Save history error: {e}")
+        return False
+
+def close_position(pos, exit_price):
+    """Calculate P&L and move a position to trade history."""
+    entry  = float(pos.get("entry_price", 0))
+    side   = pos.get("side", "BUY")
+    ptype  = pos.get("type", "")
+
+    if ptype == "myriad":
+        amount    = float(pos.get("amount", 0))
+        shares    = amount / entry if entry else 0
+        exit_val  = shares * exit_price
+        pnl_dollar = exit_val - amount
+    elif ptype == "crypto":
+        amount    = float(pos.get("amount", 0))
+        shares    = amount / entry if entry else 0
+        exit_val  = shares * exit_price
+        pnl_dollar = (exit_val - amount) if side == "BUY" else (amount - exit_val)
+    else:  # stock
+        shares    = float(pos.get("shares", 0))
+        pnl_dollar = shares * (exit_price - entry) if side == "BUY" else shares * (entry - exit_price)
+
+    pnl_pct = ((exit_price - entry) / entry * 100) if side == "BUY" else ((entry - exit_price) / entry * 100)
+
+    closed = dict(pos)
+    closed.update({
+        "exit_price":  exit_price,
+        "exit_date":   datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+        "pnl_dollar":  round(pnl_dollar, 2),
+        "pnl_pct":     round(pnl_pct, 2),
+        "win":         pnl_dollar > 0,
+    })
+    return closed
 
 # ── Flask routes ────────────────────────────────────────────────────────────
 @app.route("/", methods=["GET"])
@@ -251,6 +333,26 @@ def log_trade():
         prefill_ticker = ""
     return render_template_string(FORM_HTML, success=success, positions=load_positions(),
                                   prefill_market=prefill_market, prefill_ticker=prefill_ticker)
+
+@app.route("/close", methods=["POST"])
+def close_trade():
+    """Mark a trade as closed, record exit price, calculate P&L."""
+    pos_id     = request.form.get("pos_id", "")
+    exit_price = float(request.form.get("exit_price", 0))
+    positions  = load_positions()
+    remaining  = []
+    for pos in positions:
+        if pos.get("id") == pos_id and exit_price > 0:
+            closed = close_position(pos, exit_price)
+            history = load_history()
+            history.append(closed)
+            save_history(history)
+        else:
+            remaining.append(pos)
+    save_positions(remaining)
+    return render_template_string(FORM_HTML, success=False, positions=remaining,
+                                  prefill_market="", prefill_ticker="",
+                                  close_success=True)
 
 @app.route("/delete", methods=["POST"])
 def delete_position():
@@ -870,6 +972,168 @@ def send_sell_email(alerts):
     send_email("📊 Position Alert — Action Required", html,
                "Position Alert\n\n" + "\n\n---\n\n".join(alerts))
 
+# ══════════════════════════════════════════════════════════════════════════════
+# REPORTING — daily, weekly, monthly P&L summaries
+# ══════════════════════════════════════════════════════════════════════════════
+def build_report(trades, period_label):
+    """Build P&L stats dict from a list of closed trades."""
+    if not trades:
+        return None
+
+    total_pnl    = sum(t.get("pnl_dollar", 0) for t in trades)
+    wins         = [t for t in trades if t.get("win")]
+    losses       = [t for t in trades if not t.get("win")]
+    win_rate     = (len(wins) / len(trades) * 100) if trades else 0
+    best_trade   = max(trades, key=lambda t: t.get("pnl_dollar", 0))
+    worst_trade  = min(trades, key=lambda t: t.get("pnl_dollar", 0))
+
+    by_type = {}
+    for t in trades:
+        pt = t.get("type", "unknown")
+        by_type.setdefault(pt, {"count": 0, "pnl": 0})
+        by_type[pt]["count"] += 1
+        by_type[pt]["pnl"]   += t.get("pnl_dollar", 0)
+
+    return {
+        "period":      period_label,
+        "total_trades": len(trades),
+        "wins":         len(wins),
+        "losses":       len(losses),
+        "win_rate":     round(win_rate, 1),
+        "total_pnl":    round(total_pnl, 2),
+        "best_trade":   best_trade,
+        "worst_trade":  worst_trade,
+        "by_type":      by_type,
+    }
+
+def build_report_html(stats, all_time_pnl):
+    """Build a clean HTML email for a P&L report."""
+    pnl_colour = "#2d6a4f" if stats["total_pnl"] >= 0 else "#e63946"
+    pnl_emoji  = "📈" if stats["total_pnl"] >= 0 else "📉"
+
+    # By type breakdown
+    type_rows = ""
+    type_labels = {"myriad": "🔮 Myriad", "crypto": "₿ Crypto", "stock": "📈 Stocks"}
+    for pt, data in stats["by_type"].items():
+        col = "#2d6a4f" if data["pnl"] >= 0 else "#e63946"
+        type_rows += (
+            f'<tr><td style="padding:8px;border-bottom:1px solid #eee">{type_labels.get(pt, pt)}</td>'
+            f'<td style="padding:8px;border-bottom:1px solid #eee;text-align:center">{data["count"]}</td>'
+            f'<td style="padding:8px;border-bottom:1px solid #eee;text-align:right;'
+            f'color:{col};font-weight:bold">${data["pnl"]:+.2f}</td></tr>'
+        )
+
+    # Best/worst trade name
+    def trade_name(t):
+        if t.get("type") == "myriad":
+            return t.get("market", "?")[:50]
+        return t.get("ticker", "?")
+
+    best  = stats["best_trade"]
+    worst = stats["worst_trade"]
+
+    return (
+        '<html><body style="font-family:Arial,sans-serif;max-width:620px;margin:0 auto;padding:24px">'
+        f'<h2 style="color:#1a1a2e">{pnl_emoji} {stats["period"]} Trading Report</h2>'
+
+        # Summary box
+        f'<div style="background:#f8f9ff;border-radius:12px;padding:20px;margin:20px 0">'
+        f'<div style="display:flex;justify-content:space-between;flex-wrap:wrap;gap:12px">'
+        f'<div style="text-align:center"><div style="font-size:28px;font-weight:bold;color:{pnl_colour}">'
+        f'${stats["total_pnl"]:+.2f}</div><div style="color:#666;font-size:13px">Total P&L</div></div>'
+        f'<div style="text-align:center"><div style="font-size:28px;font-weight:bold;color:#1a1a2e">'
+        f'{stats["win_rate"]}%</div><div style="color:#666;font-size:13px">Win Rate</div></div>'
+        f'<div style="text-align:center"><div style="font-size:28px;font-weight:bold;color:#1a1a2e">'
+        f'{stats["total_trades"]}</div><div style="color:#666;font-size:13px">Trades</div></div>'
+        f'<div style="text-align:center"><div style="font-size:28px;font-weight:bold;color:#2d6a4f">'
+        f'{stats["wins"]}</div><div style="color:#666;font-size:13px">Wins</div></div>'
+        f'<div style="text-align:center"><div style="font-size:28px;font-weight:bold;color:#e63946">'
+        f'{stats["losses"]}</div><div style="color:#666;font-size:13px">Losses</div></div>'
+        f'</div></div>'
+
+        # By market type
+        f'<h3 style="color:#1a1a2e;margin:20px 0 10px">By Market Type</h3>'
+        f'<table style="width:100%;border-collapse:collapse">'
+        f'<tr style="background:#f0f2ff"><th style="padding:8px;text-align:left">Market</th>'
+        f'<th style="padding:8px;text-align:center">Trades</th>'
+        f'<th style="padding:8px;text-align:right">P&L</th></tr>'
+        f'{type_rows}</table>'
+
+        # Best and worst
+        f'<div style="display:flex;gap:12px;margin:20px 0;flex-wrap:wrap">'
+        f'<div style="flex:1;min-width:220px;background:#f0fff4;border-left:4px solid #2d6a4f;'
+        f'padding:14px;border-radius:6px">'
+        f'<div style="font-size:11px;font-weight:bold;color:#2d6a4f;margin-bottom:4px">BEST TRADE</div>'
+        f'<div style="font-size:13px;color:#1a1a2e;margin-bottom:6px">{trade_name(best)}</div>'
+        f'<div style="font-size:20px;font-weight:bold;color:#2d6a4f">${best.get("pnl_dollar",0):+.2f}</div>'
+        f'<div style="font-size:12px;color:#555">{best.get("pnl_pct",0):+.1f}%</div></div>'
+
+        f'<div style="flex:1;min-width:220px;background:#fff5f5;border-left:4px solid #e63946;'
+        f'padding:14px;border-radius:6px">'
+        f'<div style="font-size:11px;font-weight:bold;color:#e63946;margin-bottom:4px">WORST TRADE</div>'
+        f'<div style="font-size:13px;color:#1a1a2e;margin-bottom:6px">{trade_name(worst)}</div>'
+        f'<div style="font-size:20px;font-weight:bold;color:#e63946">${worst.get("pnl_dollar",0):+.2f}</div>'
+        f'<div style="font-size:12px;color:#555">{worst.get("pnl_pct",0):+.1f}%</div></div>'
+        f'</div>'
+
+        # All-time running total
+        f'<div style="background:#1a1a2e;color:white;border-radius:8px;padding:16px;'
+        f'text-align:center;margin-top:8px">'
+        f'<div style="font-size:13px;opacity:0.7;margin-bottom:4px">ALL-TIME TOTAL P&L</div>'
+        f'<div style="font-size:32px;font-weight:bold;color:{"#4ade80" if all_time_pnl >= 0 else "#f87171"}">'
+        f'${all_time_pnl:+.2f}</div></div>'
+
+        '<p style="color:#aaa;font-size:11px;margin-top:24px">Not financial advice.</p>'
+        '</body></html>'
+    )
+
+def filter_trades_by_period(trades, period):
+    """Filter trade history to a specific period."""
+    now = datetime.now(timezone.utc)
+    result = []
+    for t in trades:
+        try:
+            exit_date = datetime.strptime(t.get("exit_date", ""), "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            if period == "daily"   and (now - exit_date).days < 1:
+                result.append(t)
+            elif period == "weekly"  and (now - exit_date).days < 7:
+                result.append(t)
+            elif period == "monthly" and (now - exit_date).days < 31:
+                result.append(t)
+        except Exception:
+            continue
+    return result
+
+def send_report(period):
+    logger.info(f"Generating {period} report...")
+    history = load_history()
+    if not history:
+        logger.info(f"No closed trades yet — skipping {period} report.")
+        return
+
+    period_trades = filter_trades_by_period(history, period)
+    if not period_trades:
+        logger.info(f"No trades closed in this {period} period — skipping report.")
+        return
+
+    all_time_pnl = sum(t.get("pnl_dollar", 0) for t in history)
+    labels = {"daily": "Daily", "weekly": "Weekly", "monthly": "Monthly"}
+    stats  = build_report(period_trades, f"{labels[period]} ({datetime.now(timezone.utc).strftime('%d %b %Y')})")
+    if not stats:
+        return
+
+    html    = build_report_html(stats, all_time_pnl)
+    subject = f"{'📈' if stats['total_pnl'] >= 0 else '📉'} {labels[period]} Report — ${stats['total_pnl']:+.2f} P&L"
+    plain   = (
+        f"{labels[period]} Trading Report\n\n"
+        f"Total P&L: ${stats['total_pnl']:+.2f}\n"
+        f"Win Rate:  {stats['win_rate']}%\n"
+        f"Trades:    {stats['total_trades']} ({stats['wins']} wins, {stats['losses']} losses)\n\n"
+        f"All-time P&L: ${all_time_pnl:+.2f}"
+    )
+    send_email(subject, html, plain)
+    logger.info(f"{period.capitalize()} report sent.")
+
 # ── Entry point ─────────────────────────────────────────────────────────────
 def run_flask():
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
@@ -893,9 +1157,16 @@ if __name__ == "__main__":
     scheduler.add_job(run_myriad_cycle, "interval", minutes=CHECK_INTERVAL_MINUTES)
     scheduler.add_job(run_crypto_cycle, "interval", minutes=CHECK_INTERVAL_MINUTES)
     scheduler.add_job(run_stock_cycle,  "cron", hour=STOCK_SCAN_HOUR_UTC, minute=0)
-    logger.info("All three bots running.")
+
+    # Reports — daily 11pm UTC (6am Bangkok next day), weekly Mon 11pm, monthly 1st 11pm
+    scheduler.add_job(lambda: send_report("daily"),   "cron", hour=23, minute=0)
+    scheduler.add_job(lambda: send_report("weekly"),  "cron", day_of_week="mon", hour=23, minute=30)
+    scheduler.add_job(lambda: send_report("monthly"), "cron", day=1,  hour=23, minute=45)
+
+    logger.info("All three bots + reporting running.")
 
     try:
         scheduler.start()
     except (KeyboardInterrupt, SystemExit):
         logger.info("Bot stopped.")
+
