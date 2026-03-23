@@ -387,11 +387,23 @@ def get_all_usdt_pairs():
     """Fetch ALL active USDT trading pairs from Binance in one call."""
     try:
         r = requests.get(f"{BINANCE_BASE}/ticker/24hr", timeout=20)
+        r.raise_for_status()
         all_tickers = r.json()
+
+        # Binance sometimes returns a dict (error) instead of a list
+        if isinstance(all_tickers, dict):
+            logger.error(f"Binance returned unexpected dict: {all_tickers.get('msg', all_tickers)}")
+            return []
+
+        if not isinstance(all_tickers, list):
+            logger.error(f"Binance returned unexpected type: {type(all_tickers)}")
+            return []
+
         # Keep only USDT pairs with meaningful volume (>$500k/day)
         pairs = [
             t for t in all_tickers
-            if t.get("symbol", "").endswith("USDT")
+            if isinstance(t, dict)
+            and t.get("symbol", "").endswith("USDT")
             and float(t.get("quoteVolume", 0)) > 500000
             and float(t.get("lastPrice", 0)) > 0
         ]
