@@ -622,6 +622,9 @@ def get_coin_ohlc(coin_id: str) -> dict:
     """Fetch 90-day OHLC and calculate RSI + SMA50. Used concurrently."""
     result = {"coin_id": coin_id}
     try:
+        # Small random stagger prevents all threads hitting CoinGecko simultaneously
+        import random
+        time.sleep(random.uniform(0.3, 1.5))
         r = requests.get(f"{COINGECKO_BASE}/coins/{coin_id}/ohlc",
                          params={"vs_currency": "usd", "days": "90"}, timeout=15)
         r.raise_for_status()
@@ -661,8 +664,8 @@ def build_crypto_summaries_concurrent(top_coins: list) -> list:
             "low_24h":        float(c.get("low_24h") or 0),
         }
 
-    # Fetch OHLC concurrently (10 workers)
-    with ThreadPoolExecutor(max_workers=10) as executor:
+    # Fetch OHLC concurrently — 4 workers max to respect CoinGecko free tier rate limits
+    with ThreadPoolExecutor(max_workers=4) as executor:
         futures = {executor.submit(get_coin_ohlc, cid): cid for cid in base}
         for future in as_completed(futures):
             cid    = futures[future]
