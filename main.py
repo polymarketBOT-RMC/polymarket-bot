@@ -39,7 +39,7 @@ app    = Flask(__name__)
 
 MYRIAD_API      = "https://api-v2.myriadprotocol.com"
 AV_BASE         = "https://www.alphavantage.co/query"
-BINANCE_BASE    = "https://api.binance.com/api/v3"
+COINGECKO_BASE  = "https://api.coingecko.com/api/v3"
 JSONBIN_URL         = f"https://api.jsonbin.io/v3/b/{JSONBIN_BIN_ID}"
 JSONBIN_HISTORY_URL = f"https://api.jsonbin.io/v3/b/{JSONBIN_HISTORY_BIN_ID}"
 JSONBIN_HEADERS     = {"X-Master-Key": JSONBIN_API_KEY, "Content-Type": "application/json"}
@@ -383,157 +383,162 @@ def calculate_rsi(closes, period=14):
     rs = avg_gain / avg_loss
     return round(100 - (100 / (1 + rs)), 2)
 
-def get_all_usdt_pairs():
-    """Fetch ALL active USDT trading pairs from Binance in one call."""
+def get_all_crypto_coins():
+    """
+    Fetch top 200 coins by market cap from CoinGecko.
+    Free API, no key needed, no geographic restrictions.
+    """
     try:
-        r = requests.get(f"{BINANCE_BASE}/ticker/24hr", timeout=20)
+        r = requests.get(
+            "https://api.coingecko.com/api/v3/coins/markets",
+            params={
+                "vs_currency":  "usd",
+                "order":        "market_cap_desc",
+                "per_page":     200,
+                "page":         1,
+                "sparkline":    "false",
+                "price_change_percentage": "24h",
+            },
+            timeout=20
+        )
         r.raise_for_status()
-        all_tickers = r.json()
-
-        # Binance sometimes returns a dict (error) instead of a list
-        if isinstance(all_tickers, dict):
-            logger.error(f"Binance returned unexpected dict: {all_tickers.get('msg', all_tickers)}")
+        coins = r.json()
+        if not isinstance(coins, list):
+            logger.error(f"CoinGecko unexpected response: {coins}")
             return []
-
-        if not isinstance(all_tickers, list):
-            logger.error(f"Binance returned unexpected type: {type(all_tickers)}")
-            return []
-
-        # Keep only USDT pairs with meaningful volume (>$500k/day)
-        pairs = [
-            t for t in all_tickers
-            if isinstance(t, dict)
-            and t.get("symbol", "").endswith("USDT")
-            and float(t.get("quoteVolume", 0)) > 500000
-            and float(t.get("lastPrice", 0)) > 0
-        ]
-        logger.info(f"Found {len(pairs)} active USDT pairs with >$500k daily volume")
-        return pairs
+        logger.info(f"CoinGecko: fetched {len(coins)} coins")
+        return coins
     except Exception as e:
-        logger.error(f"Failed to fetch all pairs: {e}")
+        logger.error(f"Failed to fetch CoinGecko coins: {e}")
         return []
 
-def prefilter_pairs(pairs, top_n=20):
+
+def prefilter_pairs(coins, top_n=20):
     """
-    Score every pair and return the top_n most interesting for Claude.
-    Three buckets: big movers, high volume gainers, biggest losers (oversold bounce candidates).
-    Returns a balanced mix rather than just the biggest single-day movers.
+    Score coins into three buckets and return top_n for Claude.
+    Buckets: biggest movers, top gainers, biggest losers (oversold bounce candidates).
     """
     import math
 
-    # Bucket 1: biggest movers by volume-weighted score (top 8)
+    valid = [c for c in coins if isinstance(c, dict) and c.get("current_price", 0) > 0]
+
+    # Bucket 1: volume-weighted movers (top 8)
     scored = []
-    for t in pairs:
+    for c in valid:
         try:
-            change = abs(float(t.get("priceChangePercent", 0)))
-            volume = float(t.get("quoteVolume", 0))
+            change = abs(float(c.get("price_change_percentage_24h") or 0))
+            volume = float(c.get("total_volume") or 0)
             score  = change * math.log10(max(volume, 1))
-            scored.append((score, t))
+            scored.append((score, c))
         except Exception:
             continue
     scored.sort(key=lambda x: x[0], reverse=True)
-    top_movers = [t for _, t in scored[:8]]
+    top_movers = [c for _, c in scored[:8]]
 
-    # Bucket 2: biggest 24h gainers (momentum — top 6)
-    gainers = sorted(pairs, key=lambda t: float(t.get("priceChangePercent", 0)), reverse=True)[:6]
+    # Bucket 2: biggest gainers (top 6)
+    gainers = sorted(valid, key=lambda c: float(c.get("price_change_percentage_24h") or 0), reverse=True)[:6]
 
-    # Bucket 3: biggest 24h losers (oversold bounce candidates — top 6)
-    losers = sorted(pairs, key=lambda t: float(t.get("priceChangePercent", 0)))[:6]
+    # Bucket 3: biggest losers (top 6)
+    losers  = sorted(valid, key=lambda c: float(c.get("price_change_percentage_24h") or 0))[:6]
 
-    # Combine and deduplicate by symbol
-    seen    = set()
-    result  = []
-    for t in top_movers + gainers + losers:
-        sym = t.get("symbol", "")
-        if sym not in seen:
-            seen.add(sym)
-            result.append(t)
+    seen, result = set(), []
+    for c in top_movers + gainers + losers:
+        cid = c.get("id", "")
+        if cid not in seen:
+            seen.add(cid)
+            result.append(c)
         if len(result) >= top_n:
             break
 
-    logger.info(f"Pre-filtered to {len(result)} pairs ({len([t for t in gainers if t not in top_movers])} gainers, "
-                f"{len([t for t in losers if t not in top_movers and t not in gainers])} losers, rest movers)")
+    logger.info(f"Pre-filtered to {len(result)} coins for Claude")
     return result[:top_n]
 
-def get_crypto_candles(symbol):
-    """Fetch RSI and SMAs for a single symbol using daily candles."""
+
+def get_coin_ohlc(coin_id):
+    """Fetch 90-day OHLC data from CoinGecko and calculate RSI + SMAs."""
     result = {}
     try:
-        r = requests.get(f"{BINANCE_BASE}/klines",
-                         params={"symbol": symbol, "interval": "1d", "limit": 220},
-                         timeout=10)
-        candles = r.json()
-        if not isinstance(candles, list) or len(candles) < 14:
+        # CoinGecko OHLC — free tier supports 90 days
+        r = requests.get(
+            f"https://api.coingecko.com/api/v3/coins/{coin_id}/ohlc",
+            params={"vs_currency": "usd", "days": "90"},
+            timeout=15
+        )
+        r.raise_for_status()
+        ohlc = r.json()
+        if not isinstance(ohlc, list) or len(ohlc) < 14:
             return result
-        closes = [float(c[4]) for c in candles]
+        closes = [float(c[4]) for c in ohlc]  # close price is index 4
         result["rsi_14"] = calculate_rsi(closes)
         result["sma_50"] = round(sum(closes[-50:]) / 50, 4) if len(closes) >= 50 else None
-        result["sma_200"]= round(sum(closes[-200:]) / 200, 4) if len(closes) >= 200 else None
     except Exception as e:
-        logger.error(f"Candles error {symbol}: {e}")
+        logger.error(f"OHLC error {coin_id}: {e}")
     return result
 
-def build_crypto_summary(ticker_data):
-    """Combine 24hr ticker + candle data into one clean dict for Claude."""
-    symbol  = ticker_data.get("symbol", "")
-    price   = float(ticker_data.get("lastPrice", 0))
-    candles = get_crypto_candles(symbol)
-    sma50   = candles.get("sma_50")
-    sma200  = candles.get("sma_200")
-    rsi     = candles.get("rsi_14")
+
+def build_crypto_summary(coin):
+    """Build a clean summary dict from CoinGecko coin data + OHLC."""
+    coin_id = coin.get("id", "")
+    symbol  = coin.get("symbol", "").upper()
+    price   = float(coin.get("current_price") or 0)
+    change  = float(coin.get("price_change_percentage_24h") or 0)
+
+    ohlc    = get_coin_ohlc(coin_id)
+    rsi     = ohlc.get("rsi_14")
+    sma50   = ohlc.get("sma_50")
+
     return {
-        "symbol":         symbol,
+        "symbol":         f"{symbol}/USDT",
+        "coin_id":        coin_id,
         "price":          price,
-        "change_24h_pct": round(float(ticker_data.get("priceChangePercent", 0)), 2),
-        "volume_usdt":    round(float(ticker_data.get("quoteVolume", 0))),
-        "high_24h":       float(ticker_data.get("highPrice", 0)),
-        "low_24h":        float(ticker_data.get("lowPrice", 0)),
+        "change_24h_pct": round(change, 2),
+        "volume_usd":     round(float(coin.get("total_volume") or 0)),
+        "market_cap":     round(float(coin.get("market_cap") or 0)),
+        "high_24h":       float(coin.get("high_24h") or 0),
+        "low_24h":        float(coin.get("low_24h") or 0),
         "rsi_14":         rsi,
-        "rsi_signal":     ("OVERSOLD" if rsi and rsi < 30 else "OVERBOUGHT" if rsi and rsi > 70 else "NEUTRAL") if rsi else "NO_DATA",
+        "rsi_signal":     ("OVERSOLD" if rsi < 32 else "OVERBOUGHT" if rsi > 68 else "NEUTRAL") if rsi else "NO_DATA",
         "sma_50":         sma50,
-        "sma_200":        sma200,
         "vs_sma50":       ("above" if price > sma50 else "below") if sma50 else "insufficient_history",
-        "vs_sma200":      ("above" if price > sma200 else "below") if sma200 else "insufficient_history",
     }
 
+
 def analyze_crypto(crypto_data_list):
-    # Pre-screen: pull out any that already have clear RSI signals to highlight them
-    oversold  = [d["symbol"] for d in crypto_data_list if d.get("rsi_14") and d["rsi_14"] < 32]
-    overbought= [d["symbol"] for d in crypto_data_list if d.get("rsi_14") and d["rsi_14"] > 68]
+    oversold   = [d["symbol"] for d in crypto_data_list if d.get("rsi_14") and d["rsi_14"] < 32]
+    overbought = [d["symbol"] for d in crypto_data_list if d.get("rsi_14") and d["rsi_14"] > 68]
 
     hint = ""
     if oversold:
-        hint += f"\nNOTE: These symbols have RSI below 32 (oversold territory): {', '.join(oversold)}"
+        hint += f"\nNOTE: These coins have RSI below 32 (oversold): {', '.join(oversold)}"
     if overbought:
-        hint += f"\nNOTE: These symbols have RSI above 68 (overbought territory): {', '.join(overbought)}"
+        hint += f"\nNOTE: These coins have RSI above 68 (overbought): {', '.join(overbought)}"
 
     prompt = (
-        "You are a crypto trading analyst scanning Binance for a retail trader.\n\n"
+        "You are a crypto trading analyst helping a retail trader.\n\n"
         "Below is market data for the top movers, biggest gainers, and biggest losers "
-        "across all USDT pairs on Binance right now:\n\n"
+        "from the top 200 coins by market cap right now:\n\n"
         + json.dumps(crypto_data_list, indent=2)
         + hint
-        + "\n\nSIGNAL CRITERIA — alert if ANY of these conditions are met:\n"
-        "• RSI below 32: oversold — potential BUY opportunity\n"
-        "• RSI above 68: overbought — potential SELL/avoid signal\n"
-        "• 24h gain > +7% with volume > $5M USDT: momentum BUY\n"
-        "• 24h loss > -8% with RSI below 40: oversold bounce BUY candidate\n"
-        "• Price clearly above both SMA50 and SMA200 in uptrend: bullish confirmation\n\n"
-        "NOTE: Many newer coins won't have SMA200 data — that's fine, use RSI and 24h data.\n"
-        "Do NOT stay silent just because SMA200 is missing.\n"
-        "Max 3 alerts per cycle. Skip Low confidence.\n\n"
+        + "\n\nSIGNAL CRITERIA — alert if ANY of these are met:\n"
+        "• RSI below 32: oversold — potential BUY\n"
+        "• RSI above 68: overbought — potential SELL/avoid\n"
+        "• 24h gain > +7% with volume > $50M: momentum BUY\n"
+        "• 24h loss > -8% with RSI below 40: oversold bounce candidate\n"
+        "• Price above SMA50 after pullback: trend continuation BUY\n\n"
+        "SMA200 data is not available — do NOT require it. Use RSI + 24h change + volume.\n"
+        "Max 3 alerts. Skip Low confidence.\n\n"
         "For each opportunity use EXACTLY this format:\n\n"
         "ALERT: [SYMBOL]\n"
         "PRICE: $[current price]\n"
         "SIGNAL: [BUY / SELL / AVOID]\n"
         "RSI: [value] — [OVERSOLD / NEUTRAL / OVERBOUGHT]\n"
         "24H CHANGE: [value]%\n"
-        "TREND: [one sentence on SMA or momentum situation]\n"
+        "TREND: [one sentence on momentum or SMA situation]\n"
         "REASONING: [2 sentences on why this is worth acting on]\n"
         "SUGGESTED ENTRY: $[price or range]\n"
         "CONFIDENCE: [Medium / High]\n"
         "---\n\n"
-        "If genuinely nothing meets the criteria, respond ONLY with: NO_ALERT"
+        "If nothing meets criteria, respond ONLY with: NO_ALERT"
     )
     try:
         resp = client.messages.create(model="claude-sonnet-4-20250514", max_tokens=1500,
@@ -542,56 +547,54 @@ def analyze_crypto(crypto_data_list):
     except Exception as e:
         logger.error(f"Claude error (crypto): {e}")
         return None
-    try:
-        resp = client.messages.create(model="claude-sonnet-4-20250514", max_tokens=1500,
-                                      messages=[{"role": "user", "content": prompt}])
-        return resp.content[0].text.strip()
-    except Exception as e:
-        logger.error(f"Claude error (crypto): {e}")
-        return None
+
 
 def check_crypto_positions():
     positions = [p for p in load_positions() if p.get("type") == "crypto"]
     if not positions:
         return
-    alerts = []
+    alerts      = []
     updated_all = load_positions()
 
     for pos in positions:
-        symbol = pos.get("ticker", "")
-        if not symbol:
+        # ticker stored as e.g. "BTCUSDT" or "BTC/USDT" — normalise to CoinGecko id via symbol
+        raw_symbol = pos.get("ticker", "").replace("USDT", "").replace("/", "").lower()
+        if not raw_symbol:
             continue
-        # Use single ticker endpoint for position monitoring (faster)
         try:
-            r = requests.get(f"{BINANCE_BASE}/ticker/price",
-                             params={"symbol": symbol}, timeout=10)
-            current = float(r.json().get("price", 0))
+            r = requests.get(
+                "https://api.coingecko.com/api/v3/simple/price",
+                params={"ids": raw_symbol, "vs_currencies": "usd"},
+                timeout=10
+            )
+            data    = r.json()
+            current = float(data.get(raw_symbol, {}).get("usd", 0))
         except Exception:
             continue
         if not current:
             continue
 
-        entry  = float(pos.get("entry_price", 0))
-        amount = float(pos.get("amount", 0))
-        side   = pos.get("side", "BUY")
+        entry      = float(pos.get("entry_price", 0))
+        amount     = float(pos.get("amount", 0))
+        side       = pos.get("side", "BUY")
         pnl_pct    = ((current - entry) / entry * 100) if side == "BUY" else ((entry - current) / entry * 100)
         pnl_dollar = (amount / entry) * current - amount if side == "BUY" else amount - (amount / entry) * current
 
         alert_msg = None
         if pnl_pct >= CRYPTO_TP_PCT and not pos.get("alerted_tp"):
             alert_msg = (
-                f"TAKE PROFIT — {symbol}\n"
+                f"TAKE PROFIT — {pos.get('ticker','')}\n"
                 f"Entry: ${entry:,.2f} | Current: ${current:,.2f}\n"
                 f"Gain: +{pnl_pct:.1f}% (${pnl_dollar:+.2f})\n"
-                f"ACTION: Consider selling to lock in profit on Binance."
+                f"ACTION: Consider selling to lock in profit."
             )
             pos["alerted_tp"] = True
         elif pnl_pct <= -CRYPTO_SL_PCT and not pos.get("alerted_sl"):
             alert_msg = (
-                f"STOP LOSS — {symbol}\n"
+                f"STOP LOSS — {pos.get('ticker','')}\n"
                 f"Entry: ${entry:,.2f} | Current: ${current:,.2f}\n"
                 f"Loss: {pnl_pct:.1f}% (${pnl_dollar:+.2f})\n"
-                f"ACTION: Consider cutting this position on Binance."
+                f"ACTION: Consider cutting this position."
             )
             pos["alerted_sl"] = True
 
@@ -605,24 +608,20 @@ def check_crypto_positions():
         save_positions(updated_all)
         send_sell_email(alerts)
 
+
 def run_crypto_cycle():
-    logger.info("── Crypto cycle starting — scanning ALL Binance USDT pairs ──")
+    logger.info("── Crypto cycle starting — scanning top 200 coins via CoinGecko ──")
     check_crypto_positions()
 
-    # Step 1: fetch all pairs in one API call
-    all_pairs = get_all_usdt_pairs()
-    if not all_pairs:
-        logger.info("No Binance data. Skipping.")
+    coins = get_all_crypto_coins()
+    if not coins:
+        logger.info("No CoinGecko data. Skipping.")
         return
 
-    # Step 2: pre-filter to top movers
-    top_pairs = prefilter_pairs(all_pairs, top_n=CRYPTO_TOP_N)
+    top_coins = prefilter_pairs(coins, top_n=CRYPTO_TOP_N)
+    logger.info(f"Fetching OHLC data for {len(top_coins)} coins...")
+    summaries = [build_crypto_summary(c) for c in top_coins]
 
-    # Step 3: enrich with RSI + SMA (one candle call per pair)
-    logger.info(f"Fetching candle data for {len(top_pairs)} pairs...")
-    summaries = [build_crypto_summary(t) for t in top_pairs]
-
-    # Step 4: send to Claude
     analysis = analyze_crypto(summaries)
     if not analysis or analysis == "NO_ALERT":
         logger.info("No crypto signals this cycle.")
@@ -1306,7 +1305,7 @@ if __name__ == "__main__":
     logger.info(f"Myriad + Crypto: every {CHECK_INTERVAL_MINUTES} minutes")
     logger.info(f"Stocks: daily at {STOCK_SCAN_HOUR_UTC}:00 UTC")
     logger.info(f"Stock watchlist:  {STOCK_WATCHLIST}")
-    logger.info(f"Crypto: scanning ALL Binance USDT pairs, top {CRYPTO_TOP_N} sent to Claude")
+    logger.info(f"Crypto: scanning top 200 coins via CoinGecko, top {CRYPTO_TOP_N} sent to Claude")
 
     threading.Thread(target=run_flask, daemon=True).start()
     logger.info("Trade log web form live.")
@@ -1332,4 +1331,3 @@ if __name__ == "__main__":
         scheduler.start()
     except (KeyboardInterrupt, SystemExit):
         logger.info("Bot stopped.")
-
