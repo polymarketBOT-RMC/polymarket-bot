@@ -7,7 +7,7 @@ import requests
 import anthropic
 import logging
 from datetime import datetime, timezone, timedelta
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from flask import Flask, request, render_template_string
 from apscheduler.schedulers.blocking import BlockingScheduler
 from waitress import serve
@@ -579,12 +579,12 @@ def get_all_crypto_coins():
         r = requests.get(f"{COINGECKO_BASE}/coins/markets",
                          params={"vs_currency": "usd", "order": "market_cap_desc",
                                  "per_page": 200, "page": 1, "sparkline": "false",
-                                 "price_change_percentage": "24h"},
+                                 "price_change_percentage": "1h,24h,7d"},
                          timeout=20)
         r.raise_for_status()
         coins = r.json()
         if not isinstance(coins, list):
-            logger.error(f"CoinGecko unexpected response type")
+            logger.error("CoinGecko unexpected response type")
             return []
         logger.info(f"CoinGecko: fetched {len(coins)} coins")
         return coins
@@ -618,15 +618,15 @@ def prefilter_coins(coins, top_n=20):
             break
     return result[:top_n]
 
-def get_coin_ohlc(coin_id: str) -> dict:
-    """Fetch 90-day OHLC and calculate RSI + SMA50. Used concurrently."""
-    result = {"coin_id": coin_id}
+def get_coin_ohlc_sequential(coin_id: str) -> dict:
+    """Fetch OHLC for a single coin — called sequentially with delay."""
+    result = {}
     try:
-        # Small random stagger prevents all threads hitting CoinGecko simultaneously
-        import random
-        time.sleep(random.uniform(0.3, 1.5))
         r = requests.get(f"{COINGECKO_BASE}/coins/{coin_id}/ohlc",
                          params={"vs_currency": "usd", "days": "90"}, timeout=15)
+        if r.status_code == 429:
+            logger.warning(f"Rate limit on {coin_id} — skipping OHLC")
+            return result
         r.raise_for_status()
         ohlc = r.json()
         if not isinstance(ohlc, list) or len(ohlc) < 14:
@@ -634,54 +634,65 @@ def get_coin_ohlc(coin_id: str) -> dict:
         closes = [float(c[4]) for c in ohlc]
         result["rsi_14"] = calculate_rsi(closes)
         result["sma_50"] = round(sum(closes[-50:]) / 50, 4) if len(closes) >= 50 else None
-        # UPGRADE 8: Weekly trend — compare last 7 candles vs 14 candles ago
-        if len(closes) >= 21:
-            recent_avg = sum(closes[-7:]) / 7
-            older_avg  = sum(closes[-21:-14]) / 7
-            result["weekly_trend"] = "up" if recent_avg > older_avg else "down"
-        else:
-            result["weekly_trend"] = "unknown"
     except Exception as e:
         logger.error(f"OHLC error {coin_id}: {e}")
     return result
 
 def build_crypto_summaries_concurrent(top_coins: list) -> list:
-    """UPGRADE 3: Fetch OHLC for all coins concurrently."""
-    # Build base summaries from market data (already fetched)
-    base = {}
+    """
+    Build coin summaries using data already in the markets response.
+    Only fetch OHLC (sequentially, with delay) for coins that pass initial scoring.
+    This avoids hammering CoinGecko's OHLC rate limit.
+    """
+    summaries = []
     for c in top_coins:
-        cid    = c.get("id", "")
-        symbol = c.get("symbol", "").upper()
-        price  = float(c.get("current_price") or 0)
-        base[cid] = {
+        cid     = c.get("id", "")
+        symbol  = c.get("symbol", "").upper()
+        price   = float(c.get("current_price") or 0)
+        change_24h = float(c.get("price_change_percentage_24h") or 0)
+        change_7d  = float(c.get("price_change_percentage_7d_in_currency") or
+                           c.get("price_change_percentage_7d") or 0)
+        # Derive weekly trend from 7d price change — no extra API call needed
+        weekly_trend = "up" if change_7d > 2 else "down" if change_7d < -2 else "flat"
+        summaries.append({
             "symbol":         f"{symbol}/USDT",
             "coin_id":        cid,
             "price":          price,
-            "change_24h_pct": round(float(c.get("price_change_percentage_24h") or 0), 2),
+            "change_24h_pct": round(change_24h, 2),
+            "change_7d_pct":  round(change_7d, 2),
             "volume_usd":     round(float(c.get("total_volume") or 0)),
             "market_cap":     round(float(c.get("market_cap") or 0)),
             "high_24h":       float(c.get("high_24h") or 0),
             "low_24h":        float(c.get("low_24h") or 0),
-        }
+            "rsi_14":         None,  # filled below for qualifying coins only
+            "rsi_signal":     "NO_DATA",
+            "sma_50":         None,
+            "vs_sma50":       "unknown",
+            "weekly_trend":   weekly_trend,
+        })
 
-    # Fetch OHLC concurrently — 4 workers max to respect CoinGecko free tier rate limits
-    with ThreadPoolExecutor(max_workers=4) as executor:
-        futures = {executor.submit(get_coin_ohlc, cid): cid for cid in base}
-        for future in as_completed(futures):
-            cid    = futures[future]
-            ohlc   = future.result()
-            rsi    = ohlc.get("rsi_14")
-            sma50  = ohlc.get("sma_50")
-            price  = base[cid]["price"]
-            base[cid].update({
-                "rsi_14":       rsi,
-                "rsi_signal":   ("OVERSOLD" if rsi < 32 else "OVERBOUGHT" if rsi > 68 else "NEUTRAL") if rsi else "NO_DATA",
-                "sma_50":       sma50,
-                "vs_sma50":     ("above" if price > sma50 else "below") if sma50 else "unknown",
-                "weekly_trend": ohlc.get("weekly_trend", "unknown"),
-            })
+    # Pre-score with what we have — only fetch OHLC for coins scoring >= 1
+    # This massively reduces OHLC calls (usually 2-4 instead of 12-20)
+    needs_ohlc = []
+    for s in summaries:
+        rough_score = compute_conviction_score(s, 0.0, 50, "BUY" if s["change_24h_pct"] < 0 else "SELL")
+        if rough_score >= 1:
+            needs_ohlc.append(s)
 
-    return list(base.values())
+    logger.info(f"Fetching OHLC sequentially for {len(needs_ohlc)} qualifying coins (3s gap each)...")
+    for s in needs_ohlc:
+        ohlc = get_coin_ohlc_sequential(s["coin_id"])
+        rsi  = ohlc.get("rsi_14")
+        sma50= ohlc.get("sma_50")
+        if rsi:
+            s["rsi_14"]    = rsi
+            s["rsi_signal"]= "OVERSOLD" if rsi < 32 else "OVERBOUGHT" if rsi > 68 else "NEUTRAL"
+        if sma50:
+            s["sma_50"]  = sma50
+            s["vs_sma50"]= "above" if s["price"] > sma50 else "below"
+        time.sleep(3)  # 3-second gap — well within CoinGecko free tier limits
+
+    return summaries
 
 def compute_conviction_score(coin_data: dict, btc_1h_change: float,
                               fg_value: int, direction: str) -> int:
@@ -1531,4 +1542,5 @@ if __name__ == "__main__":
         scheduler.start()
     except (KeyboardInterrupt, SystemExit):
         logger.info("Bot stopped.")
+
 
