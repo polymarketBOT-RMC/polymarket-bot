@@ -1953,7 +1953,7 @@ def filter_and_research_markets(thin_markets: list, liquid_markets: list):
         research = research_market(q, y_price, side, ret, expires,
                                    known_poly_price=m.get("_poly_price"))
         m["_research"] = research
-        time.sleep(20)  # 20s gap = ~3 calls/min = well within 30k token/min limit
+        time.sleep(35)  # 35s gap — keeps sequential calls >60s apart, avoids 30k token/min limit
 
         # Price staleness check — re-fetch live price; abort if it moved >5pp during research
         entry_p = m.get("_entry_price", 0.5)
