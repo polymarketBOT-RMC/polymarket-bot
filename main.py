@@ -47,6 +47,9 @@ JSONBIN_URL         = f"https://api.jsonbin.io/v3/b/{JSONBIN_BIN_ID}"
 JSONBIN_HISTORY_URL = f"https://api.jsonbin.io/v3/b/{JSONBIN_HISTORY_BIN_ID}"
 JSONBIN_HEADERS     = {"X-Master-Key": JSONBIN_API_KEY, "Content-Type": "application/json"}
 
+# ── Polymarket API cache ─────────────────────────────────────────────────────
+_polymarket_cache: dict = {"ts": 0.0, "markets": []}
+
 # ── UPGRADE 1: In-memory deduplication cache ────────────────────────────────
 # Stores {signal_hash: datetime_sent} — resets on restart (acceptable)
 _dedup_cache: dict = {}
@@ -1576,7 +1579,7 @@ def get_polymarket_comparison(question: str) -> str:
 
 def research_market(question: str, current_yes_price: float,
                     target_side: str, potential_return: float,
-                    expires_at: str = "") -> dict:
+                    expires_at: str = "", known_poly_price: float = None) -> dict:
     """
     Single-call research pipeline per market.
     Gated by daily API budget cap — set MAX_RESEARCH_CALLS_PER_DAY env var.
@@ -1586,8 +1589,9 @@ def research_market(question: str, current_yes_price: float,
         return {
             "true_prob": 0.0, "edge_pp": "0", "edge_size": "BUDGET_EXCEEDED",
             "key_finding": "Daily research budget reached", "base_rate": "UNKNOWN",
-            "cross_market": "not_checked", "recommendation": "SKIP",
-            "confidence": "Low", "reasoning": "Budget cap reached for today.",
+            "cross_market": "not_checked", "resolution_clarity": "UNKNOWN",
+            "recommendation": "SKIP", "confidence": "Low",
+            "reasoning": "Budget cap reached for today.",
             "kelly_stake": PAPER_STAKE, "hours_left": None, "raw": ""
         }
     try:
@@ -1610,22 +1614,41 @@ def research_market(question: str, current_yes_price: float,
         entry_price   = current_yes_price if target_side == "YES" else 1.0 - current_yes_price
         min_true_prob = entry_price * 100 + min_edge_pp
 
+        if known_poly_price is not None:
+            poly_gap     = (known_poly_price - entry_price) * 100
+            poly_context = (f"POLYMARKET LIVE PRICE (from API): {target_side} = "
+                            f"${known_poly_price:.2f} ({known_poly_price*100:.0f}%) "
+                            f"— gap vs Myriad = {poly_gap:+.1f}pp\n")
+            search_block = (
+                f"Do BOTH of these searches (both required, use web_search tool):\n"
+                f"1. Current status/news for: {question}\n"
+                f"2. Check the resolution criteria — is it completely clear what must happen, "
+                f"who decides, and by exactly when? Flag any ambiguity.\n\n"
+                f"Polymarket price already confirmed above via live API — no need to search for it.\n\n"
+            )
+        else:
+            poly_context = ""
+            search_block = (
+                f"Do ALL THREE of these searches (all required, use web_search tool):\n"
+                f"1. Current status/news for: {question}\n"
+                f"2. Search 'site:polymarket.com {question[:60]}' — find the equivalent Polymarket "
+                f"market and report its current {target_side} price as a decimal (e.g. 0.65).\n"
+                f"3. Check the resolution criteria — is it completely clear what must happen, "
+                f"who decides, and by exactly when? Flag any ambiguity.\n\n"
+                f"Myriad implies {entry_price*100:.0f}% for {target_side}. "
+                f"If Polymarket prices {target_side} >10pp higher, that is strong evidence of mispricing.\n"
+                f"NOTE: If resolution criteria are ambiguous, the low price may reflect genuine "
+                f"uncertainty rather than mispricing — flag this.\n\n"
+            )
+
         prompt = (
             f"Prediction market researcher. One task, be concise.\n\n"
             f"QUESTION: {question}\n"
             f"MYRIAD: YES=${current_yes_price:.2f} ({current_yes_price*100:.0f}% implied)\n"
             f"TARGET: BUY {target_side} @ ${entry_price:.2f} = {potential_return:.1f}x return\n"
-            f"{time_context}\n\n"
-            f"Do ALL THREE of these searches (all required, use web_search tool):\n"
-            f"1. Current status/news for: {question}\n"
-            f"2. Search 'site:polymarket.com {question[:60]}' — find the equivalent Polymarket market "
-            f"and report its current {target_side} price as a decimal (e.g. 0.65).\n"
-            f"3. Check the resolution criteria for this market — is it completely clear what must "
-            f"happen, who decides the outcome, and by exactly when? Flag any ambiguity.\n\n"
-            f"Myriad implies {entry_price*100:.0f}% for {target_side}. "
-            f"If Polymarket prices {target_side} >10pp higher, that is strong evidence of mispricing.\n"
-            f"NOTE: If resolution criteria are ambiguous, the low Myriad price may reflect that "
-            f"uncertainty rather than genuine mispricing — flag this.\n\n"
+            f"{time_context}\n"
+            f"{poly_context}\n"
+            + search_block +
             f"Need >{min_true_prob:.0f}% true probability to recommend BUY.\n\n"
             f"Reply with ONLY these lines:\n"
             f"TRUE_PROBABILITY: [0-100]%\n"
@@ -1693,6 +1716,79 @@ def research_market(question: str, current_yes_price: float,
             "kelly_stake": PAPER_STAKE, "hours_left": None, "raw": ""
         }
 
+
+
+def fetch_polymarket_markets() -> list:
+    """
+    Fetch all active Polymarket markets. Cached for 25 minutes.
+    Free public API — no key, no geo-restriction.
+    """
+    global _polymarket_cache
+    now = time.time()
+    if now - _polymarket_cache["ts"] < 1500:
+        return _polymarket_cache["markets"]
+    try:
+        r = requests.get("https://gamma-api.polymarket.com/markets",
+                         params={"active": "true", "closed": "false", "limit": 500},
+                         timeout=15)
+        r.raise_for_status()
+        markets = r.json()
+        if isinstance(markets, list):
+            _polymarket_cache["ts"]     = now
+            _polymarket_cache["markets"] = markets
+            logger.info(f"Polymarket API: {len(markets)} active markets cached")
+            return markets
+    except Exception as e:
+        logger.error(f"Polymarket API fetch error: {e}")
+    return _polymarket_cache.get("markets", [])
+
+
+def _question_similarity(q1: str, q2: str) -> float:
+    """
+    Score similarity between two market questions using meaningful token overlap.
+    Strips stop words so numbers, names, and key nouns drive the score.
+    """
+    import re
+    stop = {"will", "the", "a", "an", "in", "by", "to", "of", "and", "or",
+            "is", "be", "on", "at", "for", "with", "this", "that", "it",
+            "not", "no", "yes", "does", "do", "have", "has", "had", "would"}
+    def tokenize(q):
+        tokens = re.sub(r"[^\w\s]", " ", q.lower()).split()
+        return set(t for t in tokens if t not in stop and len(t) > 1)
+    w1, w2 = tokenize(q1), tokenize(q2)
+    if not w1 or not w2:
+        return 0.0
+    return len(w1 & w2) / max(len(w1), len(w2))
+
+
+def find_polymarket_match(myriad_question: str, poly_markets: list):
+    """
+    Find the best matching Polymarket market for a Myriad question.
+    Returns (poly_market_dict, similarity_score) or (None, 0.0).
+    Threshold 0.45 handles same event with different wording.
+    """
+    best, best_score = None, 0.0
+    for pm in poly_markets:
+        score = _question_similarity(myriad_question, pm.get("question", ""))
+        if score > best_score:
+            best_score = score
+            best = pm
+    if best_score >= 0.45:
+        return best, best_score
+    return None, 0.0
+
+
+def get_polymarket_side_price(poly_market: dict, side: str):
+    """Extract YES or NO price from a Polymarket market dict."""
+    try:
+        raw    = poly_market.get("outcomePrices", "[]")
+        prices = json.loads(raw) if isinstance(raw, str) else raw
+        if not prices:
+            return None
+        yes_price = float(prices[0])
+        return yes_price if side == "YES" else 1.0 - yes_price
+    except Exception:
+        return None
 
 
 def _research_confirms_edge(research: dict, side: str, entry_price: float) -> bool:
@@ -1799,17 +1895,54 @@ def filter_and_research_markets(thin_markets: list, liquid_markets: list):
     # Step 2: Rank by score so we spend research calls on the best candidates first
     thin_candidates.sort(key=_score_candidate, reverse=True)
     liquid_candidates.sort(key=_score_candidate, reverse=True)
-    if thin_candidates:
-        logger.info(f"  Top thin candidate: {thin_candidates[0].get('title','')[:50]} "
-                    f"(score {_score_candidate(thin_candidates[0]):.2f})")
 
-    # Step 3: Research the top candidates (limit to avoid API costs)
+    # Step 2.5: Polymarket API pre-check — compute exact gaps before spending any research calls
+    poly_markets = fetch_polymarket_markets()
+    logger.info(f"Polymarket pre-check against {len(poly_markets)} live markets...")
+
+    def _enrich_with_poly_gap(candidates):
+        gap_confirmed, no_match = [], []
+        for m in candidates:
+            q       = m.get("title", "")
+            side    = m.get("_target_side", "YES")
+            entry_p = m.get("_entry_price", 0.5)
+            pm, sim = find_polymarket_match(q, poly_markets)
+            if pm:
+                poly_price = get_polymarket_side_price(pm, side)
+                if poly_price is not None:
+                    gap = (poly_price - entry_p) * 100
+                    m["_poly_price"]    = poly_price
+                    m["_poly_gap"]      = round(gap, 1)
+                    m["_poly_question"] = pm.get("question", "")[:80]
+                    m["_poly_sim"]      = round(sim, 2)
+                    if gap > 10.0:
+                        logger.info(f"  ✓ API gap: {q[:40]} | "
+                                    f"Myriad {entry_p*100:.0f}% → Poly {poly_price*100:.0f}% "
+                                    f"| +{gap:.1f}pp (sim {sim:.2f})")
+                        gap_confirmed.append(m)
+                    else:
+                        logger.info(f"  — No gap: {q[:40]} | {gap:+.1f}pp — skipping")
+                    continue
+            no_match.append(m)
+        # Biggest gap first — most valuable arbitrage gets researched first
+        gap_confirmed.sort(key=lambda x: x.get("_poly_gap", 0), reverse=True)
+        return gap_confirmed, no_match
+
+    thin_gap,   thin_nomatch   = _enrich_with_poly_gap(thin_candidates)
+    liquid_gap, liquid_nomatch = _enrich_with_poly_gap(liquid_candidates)
+    logger.info(f"  API pre-check: {len(thin_gap)} thin + {len(liquid_gap)} liquid gaps confirmed "
+                f"| {len(thin_nomatch)+len(liquid_nomatch)} unmatched")
+
+    # Step 3: Research gap-confirmed markets first (pass known price so Claude skips Poly search)
+    # Fallback: research 1 unmatched per tier only if gap bucket has fewer than max
     researched_thin   = []
     researched_liquid = []
+    thin_to_research   = thin_gap[:3]   + (thin_nomatch[:1]   if len(thin_gap)   < 3 else [])
+    liquid_to_research = liquid_gap[:2] + (liquid_nomatch[:1] if len(liquid_gap) < 2 else [])
 
-    logger.info(f"Researching {min(len(thin_candidates),3)} thin + {min(len(liquid_candidates),2)} liquid candidates...")
+    logger.info(f"Researching {len(thin_to_research)} thin + {len(liquid_to_research)} liquid candidates...")
 
-    for m in thin_candidates[:3]:
+    for m in thin_to_research:
         q       = m.get("title", "")
         y_price = float((next((o for o in m.get("outcomes",[]) if o.get("title","").upper() in ("YES","TRUE")), {}) or {}).get("price", 0.5))
         side    = m.get("_target_side", "YES")
@@ -1817,7 +1950,8 @@ def filter_and_research_markets(thin_markets: list, liquid_markets: list):
         expires = m.get("expiresAt", "")
 
         logger.info(f"  Researching: {q[:50]}...")
-        research = research_market(q, y_price, side, ret, expires)
+        research = research_market(q, y_price, side, ret, expires,
+                                   known_poly_price=m.get("_poly_price"))
         m["_research"] = research
         time.sleep(20)  # 20s gap = ~3 calls/min = well within 30k token/min limit
 
@@ -1841,7 +1975,7 @@ def filter_and_research_markets(thin_markets: list, liquid_markets: list):
             logger.info(f"  ✗ No edge: {q[:40]} | {research['recommendation']} | "
                         f"Edge: {research['edge_size']} | Cross-mkt: {research['cross_market']}")
 
-    for m in liquid_candidates[:2]:
+    for m in liquid_to_research:
         q       = m.get("title", "")
         y_price = float((next((o for o in m.get("outcomes",[]) if o.get("title","").upper() in ("YES","TRUE")), {}) or {}).get("price", 0.5))
         side    = m.get("_target_side", "YES")
@@ -1849,7 +1983,8 @@ def filter_and_research_markets(thin_markets: list, liquid_markets: list):
         expires = m.get("expiresAt", "")
 
         logger.info(f"  Researching liquid: {q[:50]}...")
-        research = research_market(q, y_price, side, ret, expires)
+        research = research_market(q, y_price, side, ret, expires,
+                                   known_poly_price=m.get("_poly_price"))
         m["_research"] = research
         time.sleep(20)
 
@@ -1925,11 +2060,22 @@ def analyze_myriad(thin_researched, liquid_researched):
             if float(vol or 0) < kelly_stake * 10 else ""
         )
 
+        poly_gap   = m.get("_poly_gap")
+        poly_price = m.get("_poly_price")
+        poly_q     = m.get("_poly_question", "")
+        poly_sim   = m.get("_poly_sim", 0)
+        if poly_gap is not None and poly_price is not None:
+            poly_api_str = (f"${poly_price:.2f} ({poly_price*100:.0f}%) — "
+                            f"gap {poly_gap:+.1f}pp — match sim {poly_sim:.2f} — \"{poly_q}\"")
+        else:
+            poly_api_str = "not matched"
+
         block = "\n".join([
             f"ALERT: {m.get('title','?')}",
             f"MARKET URL: {url}",
             f"MARKET ID: {mkt_id}",
             f"MARKET TIER: {tier}",
+            f"POLYMARKET API: {poly_api_str}",
             f"LIQUIDITY WARNING: {liquidity_warning}",
             f"VOLUME: ${float(vol or 0):.0f}",
             f"TIME REMAINING: {time_str}",
@@ -2252,7 +2398,8 @@ def send_myriad_email(analysis):
                            "CURRENT ODDS","SUGGESTED PLAY","POTENTIAL RETURN",
                            "MARKET IMPLIES","RESEARCH ESTIMATE","EDGE","BASE RATE",
                            "CROSS-MARKET","KEY FINDING","REASONING","EXPECTED VALUE",
-                           "KELLY STAKE","EDGE TYPE","CONFIDENCE","LIQUIDITY WARNING"]:
+                           "KELLY STAKE","EDGE TYPE","CONFIDENCE","LIQUIDITY WARNING",
+                           "POLYMARKET API"]:
                 if line.startswith(prefix + ":"):
                     fields[prefix] = line.replace(prefix + ":", "").strip()
 
@@ -2293,6 +2440,10 @@ def send_myriad_email(analysis):
             f'<span style="background:#fff3e0;color:#e65100;font-size:11px;font-weight:bold;'
             f'padding:2px 8px;border-radius:10px;margin-left:6px">⏱ {fields.get("TIME REMAINING","?")}</span>'
             f'</div>'
+            + (f'<div style="background:#e8f5e9;border-left:4px solid #2d6a4f;border-radius:4px;'
+               f'padding:8px 12px;margin:8px 0;font-size:13px">'
+               f'<strong>🔗 Polymarket (live API):</strong> {fields["POLYMARKET API"]}</div>'
+               if fields.get("POLYMARKET API") and "not matched" not in fields.get("POLYMARKET API","") else '')
             + prob_bar
             + f'<p style="margin:6px 0"><strong>Odds:</strong> {fields.get("CURRENT ODDS","?")}</p>'
             f'<p style="margin:8px 0;font-size:17px;font-weight:bold;color:#2d6a4f">▶ {fields.get("SUGGESTED PLAY","?")}</p>'
