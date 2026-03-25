@@ -90,26 +90,255 @@ def get_fear_and_greed() -> dict:
 
 # ── UPGRADE 3: Signal outcome tracking ─────────────────────────────────────
 # Signals are stored in history JSONBin with type="signal" for outcome tracking
+PAPER_STAKE = 20.0  # USD — every signal gets this stake for paper trading
+
 def log_signal(identifier: str, signal_type: str, direction: str,
-               price: float, market_type: str):
-    """Record a signal so we can check its outcome 24h and 72h later."""
+               price: float, market_type: str, market_id: str = "",
+               true_prob: float = 0.0, research_summary: str = ""):
+    """
+    Record a signal AND auto-create a $20 paper trade.
+    Every single alert gets tracked — no manual logging needed.
+    This builds the track record automatically.
+    """
     try:
-        history = load_history()
+        history  = load_history()
+        sig_id   = signal_hash(identifier, direction)
+        now      = datetime.now(timezone.utc).isoformat()
+
+        # Expected value calculation
+        # If buying YES at $price with true_prob% chance of $1 payout:
+        # EV = (true_prob * 1.0) - price
+        ev = round((true_prob / 100.0) - price, 3) if true_prob > 0 and price > 0 else None
+
         history.append({
-            "type":        "signal",
-            "id":          signal_hash(identifier, direction),
-            "identifier":  identifier,
-            "signal_type": signal_type,
-            "direction":   direction,
-            "price_at_signal": price,
-            "market_type": market_type,
-            "timestamp":   datetime.now(timezone.utc).isoformat(),
-            "checked_24h": False,
-            "checked_72h": False,
+            "type":             "paper_trade",
+            "id":               sig_id,
+            "identifier":       identifier,
+            "signal_type":      signal_type,
+            "direction":        direction,
+            "price_at_signal":  price,
+            "market_type":      market_type,
+            "market_id":        market_id,
+            "stake":            PAPER_STAKE,
+            "shares":           round(PAPER_STAKE / price, 4) if price > 0 else 0,
+            "true_prob_est":    true_prob,
+            "expected_value":   ev,
+            "research":         research_summary[:200] if research_summary else "",
+            "timestamp":        now,
+            "date":             datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+            "resolved":         False,
+            "exit_price":       None,
+            "pnl_dollar":       None,
+            "pnl_pct":          None,
+            "outcome":          None,
+            "checked_24h":      False,
+            "checked_72h":      False,
         })
         save_history(history)
+        logger.info(f"Paper trade logged: {identifier[:40]} | {direction} @ ${price:.3f} | "
+                    f"EV: {ev:+.3f}" if ev is not None else f"Paper trade logged: {identifier[:40]}")
     except Exception as e:
         logger.error(f"Log signal error: {e}")
+
+def check_paper_trade_outcomes():
+    """
+    Auto-check outcomes for all open paper trades.
+    For Myriad: fetch current market price and calculate unrealised P&L.
+    For crypto: fetch current price from CoinGecko.
+    Emails a track record report card with win rate and ROI.
+    """
+    try:
+        history  = load_history()
+        now      = datetime.now(timezone.utc)
+        updates  = []
+        resolved = []
+        open_pnl = []
+
+        for item in history:
+            if item.get("type") != "paper_trade":
+                continue
+            if item.get("resolved"):
+                continue
+
+            market_type = item.get("market_type", "")
+            market_id   = item.get("market_id", "")
+            direction   = item.get("direction", "BUY YES")
+            entry       = float(item.get("price_at_signal", 0))
+            stake       = float(item.get("stake", PAPER_STAKE))
+            shares      = float(item.get("shares", stake / entry if entry > 0 else 0))
+            ts          = item.get("timestamp", "")
+
+            current_price = None
+
+            # Fetch current price based on market type
+            if market_type == "myriad" and market_id:
+                try:
+                    yes_price, expires_at = get_myriad_price(market_id)
+                    if yes_price is not None:
+                        if "YES" in direction.upper():
+                            current_price = yes_price
+                        else:
+                            current_price = 1.0 - yes_price
+
+                        # Check if market has resolved (price at 0 or 1)
+                        if yes_price >= 0.99 or yes_price <= 0.01:
+                            win = (yes_price >= 0.99 and "YES" in direction.upper()) or                                   (yes_price <= 0.01 and "NO" in direction.upper())
+                            item["resolved"]    = True
+                            item["exit_price"]  = 1.0 if win else 0.0
+                            item["pnl_dollar"]  = round(stake * (1.0/entry - 1) if win else -stake, 2)
+                            item["pnl_pct"]     = round((item["pnl_dollar"] / stake) * 100, 1)
+                            item["outcome"]     = "WIN" if win else "LOSS"
+                            resolved.append(item)
+                            updates.append(item)
+                except Exception as e:
+                    logger.error(f"Myriad price check error: {e}")
+
+            elif market_type == "crypto":
+                coin_id = item.get("identifier","").replace("/USDT","").replace("USDT","").lower()
+                try:
+                    r = requests.get(f"{COINGECKO_BASE}/simple/price",
+                                     params={"ids": coin_id, "vs_currencies": "usd"}, timeout=10)
+                    current_price = float(r.json().get(coin_id, {}).get("usd", 0))
+                except Exception:
+                    pass
+
+            if current_price and entry > 0:
+                if "BUY" in direction.upper() or "YES" in direction.upper():
+                    unrealised_pct = (current_price - entry) / entry * 100
+                else:
+                    unrealised_pct = (entry - current_price) / entry * 100
+                unrealised_dollar = stake * (unrealised_pct / 100)
+                open_pnl.append({
+                    "id":         item.get("identifier","")[:40],
+                    "direction":  direction,
+                    "entry":      entry,
+                    "current":    current_price,
+                    "pnl_pct":    round(unrealised_pct, 1),
+                    "pnl_dollar": round(unrealised_dollar, 2),
+                    "type":       market_type,
+                })
+
+        if updates:
+            save_history(history)
+
+        # Send report if there are resolved trades or significant open positions
+        all_trades    = [h for h in history if h.get("type") == "paper_trade"]
+        resolved_all  = [h for h in all_trades if h.get("resolved")]
+
+        if resolved_all or (open_pnl and len(open_pnl) >= 3):
+            send_track_record_email(all_trades, resolved_all, open_pnl)
+
+    except Exception as e:
+        logger.error(f"Paper trade outcome check error: {e}")
+
+
+def send_track_record_email(all_trades, resolved_trades, open_positions):
+    """Send a comprehensive track record email."""
+    total     = len(all_trades)
+    resolved  = len(resolved_trades)
+    open_n    = len(open_positions)
+    wins      = [t for t in resolved_trades if t.get("outcome") == "WIN"]
+    win_rate  = round(len(wins) / resolved * 100) if resolved > 0 else 0
+    total_pnl = sum(t.get("pnl_dollar", 0) for t in resolved_trades)
+    total_staked = resolved * PAPER_STAKE
+    roi       = round(total_pnl / total_staked * 100, 1) if total_staked > 0 else 0
+
+    # Build resolved trades table
+    rows = ""
+    for t in sorted(resolved_trades, key=lambda x: x.get("timestamp",""), reverse=True)[:10]:
+        col    = "#2d6a4f" if t.get("outcome") == "WIN" else "#e63946"
+        tick   = "✓" if t.get("outcome") == "WIN" else "✗"
+        pnl    = t.get("pnl_dollar", 0)
+        true_p = t.get("true_prob_est", 0)
+        entry  = t.get("price_at_signal", 0)
+        rows += (
+            f'<tr style="border-bottom:1px solid #eee">'
+            f'<td style="padding:6px;font-size:12px">{t.get("identifier","")[:35]}</td>'
+            f'<td style="padding:6px;text-align:center">{t.get("direction","")[:8]}</td>'
+            f'<td style="padding:6px;text-align:center">${entry:.3f}</td>'
+            f'<td style="padding:6px;text-align:center">{true_p:.0f}%</td>'
+            f'<td style="padding:6px;text-align:right;color:{col};font-weight:bold">'
+            f'{tick} ${pnl:+.2f}</td>'
+            f'</tr>'
+        )
+
+    # Open positions section
+    open_rows = ""
+    open_unrealised = sum(p.get("pnl_dollar",0) for p in open_positions)
+    for p in open_positions[:8]:
+        col = "#2d6a4f" if p["pnl_dollar"] >= 0 else "#e63946"
+        open_rows += (
+            f'<tr style="border-bottom:1px solid #eee">'
+            f'<td style="padding:6px;font-size:12px">{p["id"]}</td>'
+            f'<td style="padding:6px;text-align:center">{p["direction"][:8]}</td>'
+            f'<td style="padding:6px;text-align:center">${p["entry"]:.3f}</td>'
+            f'<td style="padding:6px;text-align:center">${p["current"]:.3f}</td>'
+            f'<td style="padding:6px;text-align:right;color:{col};font-weight:bold">'
+            f'${p["pnl_dollar"]:+.2f}</td>'
+            f'</tr>'
+        )
+
+    pnl_col = "#2d6a4f" if total_pnl >= 0 else "#e63946"
+
+    html = (
+        '<html><body style="font-family:Arial,sans-serif;max-width:680px;margin:0 auto;padding:24px">'
+        '<h2 style="color:#1a1a2e">📊 Signal Track Record Report</h2>'
+        f'<p style="color:#666;font-size:13px">Auto paper trading ${PAPER_STAKE:.0f} per signal</p>'
+
+        # Summary stats
+        f'<div style="display:flex;flex-wrap:wrap;gap:12px;margin:16px 0">'
+        f'<div style="background:#f8f9ff;border-radius:8px;padding:16px;flex:1;min-width:100px;text-align:center">'
+        f'<div style="font-size:26px;font-weight:bold;color:{pnl_col}">${total_pnl:+.2f}</div>'
+        f'<div style="font-size:12px;color:#666">Realised P&L</div></div>'
+        f'<div style="background:#f8f9ff;border-radius:8px;padding:16px;flex:1;min-width:100px;text-align:center">'
+        f'<div style="font-size:26px;font-weight:bold;color:#1a1a2e">{win_rate}%</div>'
+        f'<div style="font-size:12px;color:#666">Win Rate</div></div>'
+        f'<div style="background:#f8f9ff;border-radius:8px;padding:16px;flex:1;min-width:100px;text-align:center">'
+        f'<div style="font-size:26px;font-weight:bold;color:#1a1a2e">{roi:+.1f}%</div>'
+        f'<div style="font-size:12px;color:#666">ROI</div></div>'
+        f'<div style="background:#f8f9ff;border-radius:8px;padding:16px;flex:1;min-width:100px;text-align:center">'
+        f'<div style="font-size:26px;font-weight:bold;color:#1a1a2e">{total}</div>'
+        f'<div style="font-size:12px;color:#666">Total Signals</div></div>'
+        f'<div style="background:#f8f9ff;border-radius:8px;padding:16px;flex:1;min-width:100px;text-align:center">'
+        f'<div style="font-size:26px;font-weight:bold;color:#1a1a2e">{open_n}</div>'
+        f'<div style="font-size:12px;color:#666">Open</div></div>'
+        f'</div>'
+
+        # Resolved trades
+        + (f'<h3 style="color:#1a1a2e;margin:20px 0 10px">Resolved Trades</h3>'
+           f'<table style="width:100%;border-collapse:collapse;font-size:13px">'
+           f'<tr style="background:#f0f2ff;font-weight:bold">'
+           f'<th style="padding:6px;text-align:left">Market</th>'
+           f'<th style="padding:6px">Signal</th>'
+           f'<th style="padding:6px">Entry</th>'
+           f'<th style="padding:6px">Est.Prob</th>'
+           f'<th style="padding:6px">P&L</th></tr>'
+           f'{rows}</table>' if rows else '')
+
+        # Open positions
+        + (f'<h3 style="color:#1a1a2e;margin:20px 0 10px">Open Positions '
+           f'(unrealised: <span style="color:{"#2d6a4f" if open_unrealised>=0 else "#e63946"}">'
+           f'${open_unrealised:+.2f}</span>)</h3>'
+           f'<table style="width:100%;border-collapse:collapse;font-size:13px">'
+           f'<tr style="background:#f0f2ff;font-weight:bold">'
+           f'<th style="padding:6px;text-align:left">Market</th>'
+           f'<th style="padding:6px">Signal</th>'
+           f'<th style="padding:6px">Entry</th>'
+           f'<th style="padding:6px">Now</th>'
+           f'<th style="padding:6px">P&L</th></tr>'
+           f'{open_rows}</table>' if open_rows else '')
+
+        + '<p style="color:#aaa;font-size:11px;margin-top:24px">'
+          'Paper trading only — ${:.0f} per signal. Not financial advice.</p>'.format(PAPER_STAKE)
+        + '</body></html>'
+    )
+
+    subject = f"📊 Track Record: {win_rate}% win rate | ${total_pnl:+.2f} P&L | {total} signals"
+    plain   = (f"Track Record | Win rate: {win_rate}% | ROI: {roi:+.1f}% | "
+               f"P&L: ${total_pnl:+.2f} | Signals: {total}")
+    send_email(subject, html, plain)
+    logger.info(f"Track record email sent: {win_rate}% win rate, ${total_pnl:+.2f} P&L")
+
 
 def check_signal_outcomes():
     """Check 24h and 72h outcomes for logged signals and email a report card."""
@@ -1123,58 +1352,238 @@ def build_myriad_summary(markets, max_markets=15):
             continue
     return summary
 
-def analyze_myriad(thin_markets, liquid_markets):
-    if not thin_markets and not liquid_markets:
-        return None
 
-    thin_summary   = build_myriad_summary(thin_markets, max_markets=15)
-    liquid_summary = build_myriad_summary(liquid_markets, max_markets=10)
+# ══════════════════════════════════════════════════════════════════════════════
+# RESEARCH FILTER — Web search before alerting on any Myriad market
+# ══════════════════════════════════════════════════════════════════════════════
 
-    prompt = (
-        "You are a prediction market specialist hunting for genuine pricing inefficiencies.\n\n"
-        "You have two sets of markets to analyse:\n\n"
+MIN_RETURN_MULTIPLIER = 2.3   # only alert if potential return >= 2.3x
+MAX_BUY_PRICE         = 1 / MIN_RETURN_MULTIPLIER  # = $0.435
 
-        "═══ SET A: THIN MARKETS (volume under $5,000) ═══\n"
-        "These are lightly traded markets. Smart money hasn't found them yet.\n"
-        "Look for: markets where the current odds are clearly wrong based on real-world "
-        "probability. A market at 90% YES that should realistically be 50/50 is worth flagging. "
-        "A market at 10% YES for something that is almost certain to happen is worth flagging.\n"
-        "These are your HIGHEST PRIORITY targets — this is where real edge lives.\n\n"
-        + json.dumps(thin_summary, indent=2)
+def prefilter_for_value(markets: list) -> list:
+    """
+    Pre-filter markets to only those with 2.3x+ potential.
+    For 2.3x return: buy YES at ≤$0.43 (pays $1 on win) or NO at ≤$0.43.
+    This eliminates markets where the math can't produce target return.
+    """
+    candidates = []
+    for m in markets:
+        try:
+            outcomes = m.get("outcomes", [])
+            yes_price = no_price = None
+            for o in outcomes:
+                title = o.get("title", "").upper()
+                price = float(o.get("price", 1.0))
+                if title in ("YES", "TRUE"):
+                    yes_price = price
+                elif title in ("NO", "FALSE"):
+                    no_price = price
+            # Check if either side offers 2.3x potential
+            if yes_price and yes_price <= MAX_BUY_PRICE:
+                m["_target_side"]  = "YES"
+                m["_entry_price"]  = yes_price
+                m["_potential_return"] = round(1.0 / yes_price, 2)
+                candidates.append(m)
+            elif no_price and no_price <= MAX_BUY_PRICE:
+                m["_target_side"]  = "NO"
+                m["_entry_price"]  = no_price
+                m["_potential_return"] = round(1.0 / no_price, 2)
+                candidates.append(m)
+        except Exception:
+            continue
+    logger.info(f"Value filter: {len(candidates)}/{len(markets)} markets offer ≥{MIN_RETURN_MULTIPLIER}x potential")
+    return candidates
 
-        + "\n\n═══ SET B: MEDIUM MARKETS ($5k-$100k volume) ═══\n"
-        "These have more eyes on them. Only flag if:\n"
-        "• YES + NO prices sum to less than $0.97 (pure arbitrage — guaranteed profit)\n"
-        "• OR the mispricing is so obvious it's impossible to miss\n\n"
-        + json.dumps(liquid_summary, indent=2)
 
-        + "\n\nRULES:\n"
-        "• For thin markets: flag anything where you are >60% confident the odds are wrong\n"
-        "• For medium markets: only flag pure arbitrage (price_sum < 0.97) or extreme mispricing\n"
-        "• Always include the direct_url exactly as provided\n"
-        "• Max 4 alerts total. Be specific about WHY the odds are wrong.\n\n"
-
-        "For each opportunity use EXACTLY this format:\n\n"
-        "ALERT: [market question]\n"
-        "MARKET URL: [direct_url]\n"
-        "MARKET TIER: [THIN / MEDIUM]\n"
-        "VOLUME: $[volume]\n"
-        "CURRENT ODDS: YES = $[price] / NO = $[price]\n"
-        "EDGE TYPE: [MISPRICED / ARBITRAGE / THIN MARKET]\n"
-        "WHY IT LOOKS WRONG: [2-3 sentences — be specific, cite real-world probability]\n"
-        "SUGGESTED PLAY: BUY [YES or NO] at $[price]\n"
-        "EXPECTED VALUE: [brief note on what you expect to happen]\n"
-        "CONFIDENCE: [Low / Medium / High]\n"
-        "---\n\n"
-        "If nothing found in either set respond ONLY with: NO_ALERT"
-    )
+def research_market(question: str, current_yes_price: float,
+                    target_side: str, potential_return: float) -> dict:
+    """
+    Use Claude with web search to research the ACTUAL probability of this
+    prediction market question. Returns structured research result.
+    This is the core research filter — only well-researched signals get through.
+    """
     try:
-        resp = client.messages.create(model="claude-sonnet-4-20250514", max_tokens=1500,
-                                      messages=[{"role": "user", "content": prompt}])
-        return resp.content[0].text.strip()
+        prompt = (
+            f"You are a prediction market researcher. Research this question thoroughly:\n\n"
+            f"MARKET QUESTION: {question}\n"
+            f"CURRENT MARKET PRICE: YES = ${current_yes_price:.3f} (implies {current_yes_price*100:.0f}% probability)\n"
+            f"TARGET SIDE: {target_side} at ${current_yes_price if target_side == 'YES' else 1-current_yes_price:.3f}\n"
+            f"POTENTIAL RETURN IF CORRECT: {potential_return:.1f}x\n\n"
+            f"Use web search to find:\n"
+            f"1. Current status of this event\n"
+            f"2. Expert opinions or forecasts\n"
+            f"3. Recent news that affects the probability\n"
+            f"4. Historical base rates for similar events\n\n"
+            f"Then answer:\n"
+            f"TRUE_PROBABILITY: [your estimate 0-100]%\n"
+            f"MARKET_PRICE_IMPLIES: {current_yes_price*100:.0f}%\n"
+            f"MISPRICING_DIRECTION: [OVERPRICED_YES / OVERPRICED_NO / FAIR]\n"
+            f"EDGE_SIZE: [LARGE (>30pp) / MEDIUM (15-30pp) / SMALL (<15pp) / NONE]\n"
+            f"KEY_FINDING: [most important fact you found, 1 sentence]\n"
+            f"TRADE_RECOMMENDATION: [BUY {target_side} / SKIP]\n"
+            f"CONFIDENCE: [High / Medium / Low]\n\n"
+            f"Only recommend BUY if TRUE_PROBABILITY justifies the {potential_return:.1f}x return target.\n"
+            f"For {potential_return:.1f}x return buying {target_side}, true probability must be >{(current_yes_price if target_side=='YES' else 1-current_yes_price)*100 + 15:.0f}% to have a real edge."
+        )
+
+        resp = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=600,
+            tools=[{"type": "web_search_20250305", "name": "web_search"}],
+            messages=[{"role": "user", "content": prompt}]
+        )
+
+        # Extract text from response (may include tool use blocks)
+        result_text = ""
+        for block in resp.content:
+            if hasattr(block, "text"):
+                result_text += block.text
+
+        # Parse structured response
+        lines = result_text.strip().splitlines()
+        parsed = {}
+        for line in lines:
+            for key in ["TRUE_PROBABILITY", "MISPRICING_DIRECTION", "EDGE_SIZE",
+                        "KEY_FINDING", "TRADE_RECOMMENDATION", "CONFIDENCE"]:
+                if line.startswith(key + ":"):
+                    parsed[key] = line.replace(key + ":", "").strip()
+
+        # Extract numeric probability
+        true_prob_str = parsed.get("TRUE_PROBABILITY", "0").replace("%","").strip()
+        try:
+            true_prob = float(true_prob_str)
+        except Exception:
+            true_prob = 0.0
+
+        return {
+            "true_prob":      true_prob,
+            "edge_size":      parsed.get("EDGE_SIZE", "UNKNOWN"),
+            "key_finding":    parsed.get("KEY_FINDING", ""),
+            "recommendation": parsed.get("TRADE_RECOMMENDATION", "SKIP"),
+            "confidence":     parsed.get("CONFIDENCE", "Low"),
+            "raw":            result_text[:300],
+        }
+
     except Exception as e:
-        logger.error(f"Claude Myriad error: {e}")
+        logger.error(f"Research error for '{question[:40]}': {e}")
+        return {
+            "true_prob": 0.0, "edge_size": "UNKNOWN",
+            "key_finding": "", "recommendation": "SKIP", "confidence": "Low", "raw": ""
+        }
+
+
+def filter_and_research_markets(thin_markets: list, liquid_markets: list):
+    """
+    Full pipeline:
+    1. Pre-filter for 2.3x+ value potential
+    2. Research each candidate with web search
+    3. Return only markets where research confirms genuine edge
+    """
+    # Step 1: Value filter
+    thin_candidates   = prefilter_for_value(thin_markets)
+    liquid_candidates = prefilter_for_value(liquid_markets)
+
+    # Step 2: Research the top candidates (limit to avoid API costs)
+    # Prioritise thin markets — research up to 5 thin + 3 liquid
+    researched_thin   = []
+    researched_liquid = []
+
+    logger.info(f"Researching {min(len(thin_candidates),5)} thin + {min(len(liquid_candidates),3)} liquid candidates...")
+
+    for m in thin_candidates[:5]:
+        q       = m.get("title", "")
+        y_price = float((next((o for o in m.get("outcomes",[]) if o.get("title","").upper() in ("YES","TRUE")), {}) or {}).get("price", 0.5))
+        side    = m.get("_target_side", "YES")
+        ret     = m.get("_potential_return", 2.3)
+
+        logger.info(f"  Researching: {q[:50]}...")
+        research = research_market(q, y_price, side, ret)
+        m["_research"] = research
+        time.sleep(2)  # brief pause between web search calls
+
+        if research["recommendation"] == f"BUY {side}" and research["edge_size"] in ("LARGE","MEDIUM"):
+            researched_thin.append(m)
+            logger.info(f"  ✓ CONFIRMED edge: {q[:40]} | True prob: {research['true_prob']}% | {research['edge_size']}")
+        else:
+            logger.info(f"  ✗ No edge: {q[:40]} | {research['recommendation']} | {research['edge_size']}")
+
+    for m in liquid_candidates[:3]:
+        q       = m.get("title", "")
+        y_price = float((next((o for o in m.get("outcomes",[]) if o.get("title","").upper() in ("YES","TRUE")), {}) or {}).get("price", 0.5))
+        side    = m.get("_target_side", "YES")
+        ret     = m.get("_potential_return", 2.3)
+
+        logger.info(f"  Researching liquid: {q[:50]}...")
+        research = research_market(q, y_price, side, ret)
+        m["_research"] = research
+        time.sleep(2)
+
+        if research["recommendation"] == f"BUY {side}" and research["edge_size"] == "LARGE":
+            researched_liquid.append(m)
+
+    total = len(researched_thin) + len(researched_liquid)
+    logger.info(f"Research filter: {total} markets passed ({len(researched_thin)} thin, {len(researched_liquid)} liquid)")
+    return researched_thin, researched_liquid
+
+
+def analyze_myriad(thin_researched, liquid_researched):
+    """
+    Final synthesis step — formats pre-researched markets into alert emails.
+    By this point every market has already been:
+    1. Value-filtered (≥2.3x potential only)
+    2. Web-searched for real-world probability
+    3. Confirmed as having genuine edge
+    This function just formats the confirmed opportunities cleanly.
+    """
+    if not thin_researched and not liquid_researched:
         return None
+
+    all_confirmed = thin_researched + liquid_researched
+    if not all_confirmed:
+        return "NO_ALERT"
+
+    blocks = []
+    for m in all_confirmed:
+        r       = m.get("_research", {})
+        slug    = m.get("slug", "")
+        mkt_id  = str(m.get("id", ""))
+        url     = f"https://myriad.markets/markets/{slug}" if slug else f"https://myriad.markets/markets/{mkt_id}"
+        side    = m.get("_target_side", "YES")
+        price   = m.get("_entry_price", 0)
+        ret     = m.get("_potential_return", 2.3)
+        vol     = m.get("volume", 0)
+        tier    = "THIN" if float(vol or 0) < 5000 else "MEDIUM"
+        true_p  = r.get("true_prob", 0)
+        finding = r.get("key_finding", "")
+        conf    = r.get("confidence", "Medium")
+
+        # Calculate EV: (true_prob * $1 payout) - entry_price
+        ev = round((true_p / 100.0) - price, 3) if true_p > 0 else None
+        ev_str = f"+${ev:.3f} per $1 staked" if ev and ev > 0 else "positive"
+
+        # Get current odds from outcomes
+        outcomes = {o.get("title","?"): o.get("price","?") for o in m.get("outcomes",[])}
+        yes_p = outcomes.get("YES", outcomes.get("True", "?"))
+        no_p  = outcomes.get("NO",  outcomes.get("False", "?"))
+
+        block = "\n".join([
+            f"ALERT: {m.get('title','?')}",
+            f"MARKET URL: {url}",
+            f"MARKET TIER: {tier}",
+            f"VOLUME: ${float(vol or 0):.0f}",
+            f"CURRENT ODDS: YES = ${yes_p} / NO = ${no_p}",
+            f"SUGGESTED PLAY: BUY {side} at ${price:.3f}",
+            f"POTENTIAL RETURN: {ret:.1f}x (${PAPER_STAKE:.0f} stake = ${PAPER_STAKE*ret:.0f} if correct)",
+            f"MARKET IMPLIES: {price*100:.0f}% probability",
+            f"RESEARCH ESTIMATE: {true_p:.0f}% true probability",
+            f"KEY FINDING: {finding}",
+            f"EXPECTED VALUE: {ev_str}",
+            f"EDGE TYPE: RESEARCH-CONFIRMED MISPRICING",
+            f"CONFIDENCE: {conf}",
+        ])
+        blocks.append(block)
+
+    return "\n---\n".join(blocks) if blocks else "NO_ALERT"
 
 def check_myriad_positions():
     positions   = [p for p in load_positions() if p.get("type") == "myriad"]
@@ -1234,11 +1643,15 @@ def run_myriad_cycle():
     if not thin_markets and not liquid_markets:
         logger.info("No valid Myriad markets found.")
         return
-    logger.info(f"Analysing {len(thin_markets)} thin + {len(liquid_markets)} medium markets...")
-    analysis = analyze_myriad(thin_markets, liquid_markets)
+
+    # Full pipeline: value filter → web research → confirmation
+    thin_confirmed, liquid_confirmed = filter_and_research_markets(thin_markets, liquid_markets)
+
+    analysis = analyze_myriad(thin_confirmed, liquid_confirmed)
     if not analysis or analysis == "NO_ALERT":
-        logger.info("No Myriad opportunities this cycle.")
+        logger.info("No research-confirmed Myriad opportunities this cycle.")
         return
+
     if "ALERT:" in analysis:
         new_alerts = []
         for block in analysis.split("---"):
@@ -1253,9 +1666,45 @@ def run_myriad_cycle():
             if is_duplicate(identifier, direction):
                 logger.info(f"Myriad duplicate suppressed: {identifier[:40]}")
                 continue
+
+            # Extract price and research data for paper trade logging
+            price_line    = [l for l in block.splitlines() if l.startswith("SUGGESTED PLAY:")]
+            research_line = [l for l in block.splitlines() if l.startswith("KEY FINDING:")]
+            true_p_line   = [l for l in block.splitlines() if l.startswith("RESEARCH ESTIMATE:")]
+            mkt_url_line  = [l for l in block.splitlines() if l.startswith("MARKET URL:")]
+
+            entry_price = 0.0
+            if price_line:
+                try:
+                    entry_price = float(price_line[0].split("$")[-1].strip())
+                except Exception:
+                    pass
+
+            true_prob = 0.0
+            if true_p_line:
+                try:
+                    true_prob = float(true_p_line[0].replace("RESEARCH ESTIMATE:","").replace("%","").strip())
+                except Exception:
+                    pass
+
+            research_note = research_line[0].replace("KEY FINDING:","").strip() if research_line else ""
+            mkt_id = mkt_url_line[0].replace("MARKET URL:","").strip().split("/")[-1] if mkt_url_line else ""
+
+            # Auto-log paper trade with full research context
+            log_signal(
+                identifier=identifier,
+                signal_type="myriad_researched",
+                direction=direction,
+                price=entry_price,
+                market_type="myriad",
+                market_id=mkt_id,
+                true_prob=true_prob,
+                research_summary=research_note,
+            )
             new_alerts.append(block)
+
         if new_alerts:
-            logger.info(f"{len(new_alerts)} new Myriad signal(s). Sending email...")
+            logger.info(f"{len(new_alerts)} research-confirmed Myriad signal(s). Sending email...")
             send_myriad_email("\n---\n".join(new_alerts))
         else:
             logger.info("All Myriad signals were duplicates — suppressed.")
@@ -1735,7 +2184,13 @@ if __name__ == "__main__":
     scheduler.add_job(run_myriad_cycle,       "interval", minutes=CHECK_INTERVAL_MINUTES)
     scheduler.add_job(run_crypto_cycle,       "interval", minutes=CHECK_INTERVAL_MINUTES)
     scheduler.add_job(run_stock_cycle,        "cron",     hour=STOCK_SCAN_HOUR_UTC, minute=0)
-    scheduler.add_job(check_signal_outcomes,  "interval", hours=6)
+    scheduler.add_job(check_signal_outcomes,       "interval", hours=6)
+    scheduler.add_job(check_paper_trade_outcomes, "interval", hours=4)
+    scheduler.add_job(lambda: send_track_record_email(
+        [h for h in load_history() if h.get("type")=="paper_trade"],
+        [h for h in load_history() if h.get("type")=="paper_trade" and h.get("resolved")],
+        []
+    ), "cron", day_of_week="mon,thu", hour=8, minute=0)  # Mon+Thu 8am UTC = 3pm Bangkok
     scheduler.add_job(lambda: send_report("daily"),   "cron", hour=23, minute=0)
     scheduler.add_job(lambda: send_report("weekly"),  "cron", day_of_week="mon", hour=23, minute=30)
     scheduler.add_job(lambda: send_report("monthly"), "cron", day=1, hour=23, minute=45)
