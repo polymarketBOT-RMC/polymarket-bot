@@ -1492,27 +1492,7 @@ def kelly_criterion(true_prob: float, entry_price: float,
 
 
 def get_polymarket_comparison(question: str) -> str:
-    """
-    Search Polymarket and Manifold for the same question.
-    If they price it differently to Myriad, that's a cross-market signal.
-    """
-    try:
-        resp = client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=200,
-            tools=[{"type": "web_search_20250305", "name": "web_search"}],
-            messages=[{"role": "user", "content":
-                f"Search Polymarket and Manifold Markets for this question or very similar ones: "
-                f"'{question}'. "
-                f"Report ONLY: the platform name, the YES price, and the URL. "
-                f"If not found on either platform say NOT_FOUND. "
-                f"Format: PLATFORM: [name] | PRICE: [price] | URL: [url]"}]
-        )
-        for block in resp.content:
-            if hasattr(block, "text") and block.text.strip():
-                return block.text.strip()[:200]
-    except Exception:
-        pass
+    """Deprecated — now merged into research_market to save API calls."""
     return "NOT_FOUND"
 
 
@@ -1520,81 +1500,55 @@ def research_market(question: str, current_yes_price: float,
                     target_side: str, potential_return: float,
                     expires_at: str = "") -> dict:
     """
-    Deep research pipeline for a prediction market.
-    Stage 1: Check Polymarket/Manifold for cross-market pricing
-    Stage 2: Multi-angle web research (news + base rates + expert forecasts)
-    Stage 3: Time-decay adjusted probability estimate
-    Stage 4: Kelly Criterion position sizing
-    Only markets with LARGE or MEDIUM edge AND research confidence >= Medium pass.
+    Single-call research pipeline per market.
+    Asks Claude to: search web for current status + check Polymarket + estimate probability.
+    One API call per market — keeps token usage within free tier rate limits.
     """
     try:
-        # Calculate time remaining
-        hours_left = None
+        # Time remaining
+        hours_left   = None
         time_context = ""
+        min_edge_pp  = 20
         if expires_at:
             try:
                 exp_dt     = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
                 hours_left = (exp_dt - datetime.now(timezone.utc)).total_seconds() / 3600
-                days_left  = hours_left / 24
-                time_context = f"TIME REMAINING: {days_left:.1f} days ({hours_left:.0f} hours)"
-
-                # Time-decay threshold: longer time = lower required probability edge
-                # Short-dated markets need bigger edge to be worth the risk
+                time_context = f"Expires in: {hours_left/24:.1f} days"
                 if hours_left < 48:
-                    min_edge_pp = 35  # need 35pp+ edge for markets expiring within 48h
-                elif hours_left < 168:  # 1 week
+                    min_edge_pp = 35
+                elif hours_left < 168:
                     min_edge_pp = 25
-                else:
-                    min_edge_pp = 15
             except Exception:
-                min_edge_pp = 20
-                time_context = ""
-        else:
-            min_edge_pp = 20
+                pass
 
-        entry_price = current_yes_price if target_side == "YES" else 1.0 - current_yes_price
+        entry_price   = current_yes_price if target_side == "YES" else 1.0 - current_yes_price
         min_true_prob = entry_price * 100 + min_edge_pp
 
-        # Stage 1: Cross-market check (fast)
-        poly_result = get_polymarket_comparison(question)
-        cross_market_context = ""
-        if poly_result and "NOT_FOUND" not in poly_result:
-            cross_market_context = "\nCROSS-MARKET PRICING: " + poly_result
-
-        # Stage 2: Deep research
         prompt = (
-            f"You are an expert prediction market analyst. Research this thoroughly.\n\n"
+            f"Prediction market researcher. One task, be concise.\n\n"
             f"QUESTION: {question}\n"
-            f"MYRIAD PRICE: YES = ${current_yes_price:.3f} ({current_yes_price*100:.0f}% implied probability)\n"
-            f"TARGET: BUY {target_side} at ${entry_price:.3f} for {potential_return:.1f}x return\n"
-            f"{time_context}\n"
-            f"{cross_market_context}\n\n"
-            f"Research in this order:\n"
-            f"1. Search for the CURRENT STATUS of this event right now\n"
-            f"2. Search for expert forecasts or prediction aggregators (FiveThirtyEight, Metaculus, etc.)\n"
-            f"3. Search for the MOST RECENT NEWS (last 7 days) affecting this outcome\n"
-            f"4. Consider the BASE RATE: historically, how often do similar events happen?\n\n"
-            f"CRITICAL THRESHOLDS:\n"
-            f"- Market implies {current_yes_price*100:.0f}% probability for YES\n"
-            f"- To recommend BUY {target_side}, your true probability estimate must show "
-            f"at least {min_edge_pp}pp edge (need >{min_true_prob:.0f}% true probability)\n"
-            f"- If cross-market data shows similar price, there is probably no edge\n"
-            f"- If cross-market data shows very different price, explain why Myriad might be wrong\n\n"
-            f"Respond with EXACTLY these fields:\n"
+            f"MYRIAD: YES=${current_yes_price:.2f} ({current_yes_price*100:.0f}% implied)\n"
+            f"TARGET: BUY {target_side} @ ${entry_price:.2f} = {potential_return:.1f}x return\n"
+            f"{time_context}\n\n"
+            f"Do these searches (use web_search tool):\n"
+            f"1. Current status/news for this event\n"
+            f"2. Search 'polymarket {question[:50]}' for cross-market price\n\n"
+            f"Need >{min_true_prob:.0f}% true probability to recommend BUY.\n\n"
+            f"Reply with ONLY these lines:\n"
             f"TRUE_PROBABILITY: [0-100]%\n"
-            f"EDGE_PP: [percentage points of edge, positive or negative]\n"
-            f"EDGE_SIZE: [LARGE(>{min_edge_pp+10}pp) / MEDIUM({min_edge_pp}-{min_edge_pp+10}pp) / SMALL / NONE]\n"
-            f"KEY_FINDING: [single most important fact that determines the outcome]\n"
-            f"BASE_RATE: [historical frequency of similar events, or UNKNOWN]\n"
-            f"CROSS_MARKET: [same/different/not_found vs Polymarket/Manifold]\n"
+            f"EDGE_PP: [number]\n"
+            f"EDGE_SIZE: [LARGE/MEDIUM/SMALL/NONE]\n"
+            f"KEY_FINDING: [1 sentence]\n"
+            f"BASE_RATE: [brief or UNKNOWN]\n"
+            f"CROSS_MARKET: [price if found, or not_found]\n"
             f"TRADE_RECOMMENDATION: [BUY {target_side} / SKIP]\n"
-            f"CONFIDENCE: [High / Medium / Low]\n"
-            f"REASONING: [2 sentences maximum]"
+            f"CONFIDENCE: [High/Medium/Low]\n"
+            f"REASONING: [max 1 sentence]"
         )
 
         resp = client.messages.create(
             model="claude-sonnet-4-20250514",
-            max_tokens=800,
+            max_tokens=400,
             tools=[{"type": "web_search_20250305", "name": "web_search"}],
             messages=[{"role": "user", "content": prompt}]
         )
@@ -1604,12 +1558,11 @@ def research_market(question: str, current_yes_price: float,
             if hasattr(block, "text"):
                 result_text += block.text
 
-        # Parse structured response
         parsed = {}
         for line in result_text.strip().splitlines():
-            for key in ["TRUE_PROBABILITY", "EDGE_PP", "EDGE_SIZE", "KEY_FINDING",
-                        "BASE_RATE", "CROSS_MARKET", "TRADE_RECOMMENDATION",
-                        "CONFIDENCE", "REASONING"]:
+            for key in ["TRUE_PROBABILITY","EDGE_PP","EDGE_SIZE","KEY_FINDING",
+                        "BASE_RATE","CROSS_MARKET","TRADE_RECOMMENDATION",
+                        "CONFIDENCE","REASONING"]:
                 if line.startswith(key + ":"):
                     parsed[key] = line.replace(key + ":", "").strip()
 
@@ -1618,7 +1571,6 @@ def research_market(question: str, current_yes_price: float,
         except Exception:
             true_prob = 0.0
 
-        # Kelly sizing based on research result
         kelly_stake = kelly_criterion(true_prob, entry_price) if true_prob > 0 else PAPER_STAKE
 
         return {
@@ -1633,7 +1585,7 @@ def research_market(question: str, current_yes_price: float,
             "reasoning":      parsed.get("REASONING", ""),
             "kelly_stake":    kelly_stake,
             "hours_left":     hours_left,
-            "raw":            result_text[:400],
+            "raw":            result_text[:300],
         }
 
     except Exception as e:
@@ -1644,6 +1596,7 @@ def research_market(question: str, current_yes_price: float,
             "recommendation": "SKIP", "confidence": "Low", "reasoning": "",
             "kelly_stake": PAPER_STAKE, "hours_left": None, "raw": ""
         }
+
 
 
 def filter_and_research_markets(thin_markets: list, liquid_markets: list):
@@ -1662,9 +1615,9 @@ def filter_and_research_markets(thin_markets: list, liquid_markets: list):
     researched_thin   = []
     researched_liquid = []
 
-    logger.info(f"Researching {min(len(thin_candidates),5)} thin + {min(len(liquid_candidates),3)} liquid candidates...")
+    logger.info(f"Researching {min(len(thin_candidates),3)} thin + {min(len(liquid_candidates),2)} liquid candidates...")
 
-    for m in thin_candidates[:5]:
+    for m in thin_candidates[:3]:
         q       = m.get("title", "")
         y_price = float((next((o for o in m.get("outcomes",[]) if o.get("title","").upper() in ("YES","TRUE")), {}) or {}).get("price", 0.5))
         side    = m.get("_target_side", "YES")
@@ -1674,7 +1627,7 @@ def filter_and_research_markets(thin_markets: list, liquid_markets: list):
         logger.info(f"  Researching: {q[:50]}...")
         research = research_market(q, y_price, side, ret, expires)
         m["_research"] = research
-        time.sleep(3)
+        time.sleep(20)  # 20s gap = ~3 calls/min = well within 30k token/min limit
 
         if research["recommendation"] == f"BUY {side}" and research["edge_size"] in ("LARGE","MEDIUM"):
             researched_thin.append(m)
@@ -1685,7 +1638,7 @@ def filter_and_research_markets(thin_markets: list, liquid_markets: list):
             logger.info(f"  ✗ No edge: {q[:40]} | {research['recommendation']} | "
                         f"Edge: {research['edge_size']} | Cross-mkt: {research['cross_market']}")
 
-    for m in liquid_candidates[:3]:
+    for m in liquid_candidates[:2]:
         q       = m.get("title", "")
         y_price = float((next((o for o in m.get("outcomes",[]) if o.get("title","").upper() in ("YES","TRUE")), {}) or {}).get("price", 0.5))
         side    = m.get("_target_side", "YES")
@@ -1695,7 +1648,7 @@ def filter_and_research_markets(thin_markets: list, liquid_markets: list):
         logger.info(f"  Researching liquid: {q[:50]}...")
         research = research_market(q, y_price, side, ret, expires)
         m["_research"] = research
-        time.sleep(3)
+        time.sleep(20)
 
         if research["recommendation"] == f"BUY {side}" and research["edge_size"] == "LARGE":
             researched_liquid.append(m)
