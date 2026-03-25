@@ -40,6 +40,27 @@ STOCK_WATCHLIST = [t.strip().upper() for t in
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 app    = Flask(__name__)
 
+def _claude_call(**kwargs):
+    """
+    Wrapper around client.messages.create with retry logic for transient errors:
+    - 429 rate_limit_error: wait 75s (rolling token window clears) then retry once
+    - 529 overloaded_error: wait 60s (server-side overload) then retry once
+    All other errors propagate immediately.
+    """
+    try:
+        return client.messages.create(**kwargs)
+    except Exception as e:
+        err = str(e)
+        if "429" in err or "rate_limit" in err.lower():
+            logger.warning(f"Rate limit 429 — sleeping 75s then retrying")
+            time.sleep(75)
+        elif "529" in err or "overloaded" in err.lower():
+            logger.warning(f"Anthropic overloaded 529 — sleeping 60s then retrying")
+            time.sleep(60)
+        else:
+            raise
+        return client.messages.create(**kwargs)  # second attempt — raises if still failing
+
 MYRIAD_API          = "https://api-v2.myriadprotocol.com"
 AV_BASE             = "https://www.alphavantage.co/query"
 COINGECKO_BASE      = "https://api.coingecko.com/api/v3"
@@ -1264,8 +1285,8 @@ def analyze_crypto(crypto_data_list, fg: dict, btc_1h_change: float,
         "If nothing meets criteria respond ONLY with: NO_ALERT"
     )
     try:
-        resp = client.messages.create(model="claude-sonnet-4-20250514", max_tokens=1500,
-                                      messages=[{"role": "user", "content": prompt}])
+        resp = _claude_call(model="claude-sonnet-4-20250514", max_tokens=1500,
+                            messages=[{"role": "user", "content": prompt}])
         return resp.content[0].text.strip()
     except Exception as e:
         logger.error(f"Claude crypto error: {e}")
@@ -1718,23 +1739,13 @@ def research_market(question: str, current_yes_price: float,
             f"REASONING: [max 1 sentence]"
         )
 
-        def _call_api():
-            return client.messages.create(
+        try:
+            resp = _claude_call(
                 model="claude-sonnet-4-20250514",
                 max_tokens=1500,
                 tools=[{"type": "web_search_20250305", "name": "web_search"}],
                 messages=[{"role": "user", "content": prompt}]
             )
-
-        try:
-            resp = _call_api()
-        except Exception as first_err:
-            if "429" in str(first_err) or "rate_limit" in str(first_err).lower():
-                logger.warning(f"Rate limit 429 on first attempt — sleeping {RESEARCH_COOLDOWN}s then retrying")
-                time.sleep(RESEARCH_COOLDOWN)
-                resp = _call_api()   # raises if still failing
-            else:
-                raise
         finally:
             _last_research_end = time.time()
 
@@ -1919,7 +1930,7 @@ def fetch_metaculus_questions() -> list:
         return _metaculus_cache["questions"]
     try:
         r = requests.get("https://www.metaculus.com/api2/questions/",
-                         params={"status": "open", "type": "forecast", "limit": 200},
+                         params={"status": "open", "limit": 200},
                          timeout=15)
         r.raise_for_status()
         data      = r.json()
@@ -2514,8 +2525,8 @@ def analyze_stocks(stock_data_list):
         "If nothing, respond ONLY with: NO_ALERT"
     )
     try:
-        resp = client.messages.create(model="claude-sonnet-4-20250514", max_tokens=1500,
-                                      messages=[{"role": "user", "content": prompt}])
+        resp = _claude_call(model="claude-sonnet-4-20250514", max_tokens=1500,
+                            messages=[{"role": "user", "content": prompt}])
         return resp.content[0].text.strip()
     except Exception as e:
         logger.error(f"Claude stocks error: {e}")
