@@ -92,6 +92,31 @@ def get_fear_and_greed() -> dict:
 # Signals are stored in history JSONBin with type="signal" for outcome tracking
 PAPER_STAKE = 20.0  # USD — every signal gets this stake for paper trading
 
+# ── API cost control ─────────────────────────────────────────────────────────
+# Approximate cost per research call: ~1500 tokens in + 400 out ≈ $0.006
+# At 5 markets per cycle × 48 cycles/day = up to 240 calls/day = ~$1.44/day
+# Daily cap prevents runaway costs. Set via env var or default to 20 calls/day.
+MAX_RESEARCH_CALLS_PER_DAY = int(os.environ.get("MAX_RESEARCH_CALLS_PER_DAY", "20"))
+_research_calls_today = {"date": "", "count": 0}
+_research_lock = threading.Lock()
+
+def can_research() -> bool:
+    """Check if we're within today's research call budget."""
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    with _research_lock:
+        if _research_calls_today["date"] != today:
+            _research_calls_today["date"]  = today
+            _research_calls_today["count"] = 0
+        if _research_calls_today["count"] >= MAX_RESEARCH_CALLS_PER_DAY:
+            logger.warning(f"Daily research cap reached ({MAX_RESEARCH_CALLS_PER_DAY} calls). "
+                           f"Skipping research this cycle.")
+            return False
+        _research_calls_today["count"] += 1
+        remaining = MAX_RESEARCH_CALLS_PER_DAY - _research_calls_today["count"]
+        logger.info(f"Research call {_research_calls_today['count']}/{MAX_RESEARCH_CALLS_PER_DAY} "
+                    f"today ({remaining} remaining)")
+        return True
+
 def log_signal(identifier: str, signal_type: str, direction: str,
                price: float, market_type: str, market_id: str = "",
                true_prob: float = 0.0, research_summary: str = ""):
@@ -1501,9 +1526,17 @@ def research_market(question: str, current_yes_price: float,
                     expires_at: str = "") -> dict:
     """
     Single-call research pipeline per market.
-    Asks Claude to: search web for current status + check Polymarket + estimate probability.
-    One API call per market — keeps token usage within free tier rate limits.
+    Gated by daily API budget cap — set MAX_RESEARCH_CALLS_PER_DAY env var.
     """
+    # Check daily budget before making any API call
+    if not can_research():
+        return {
+            "true_prob": 0.0, "edge_pp": "0", "edge_size": "BUDGET_EXCEEDED",
+            "key_finding": "Daily research budget reached", "base_rate": "UNKNOWN",
+            "cross_market": "not_checked", "recommendation": "SKIP",
+            "confidence": "Low", "reasoning": "Budget cap reached for today.",
+            "kelly_stake": PAPER_STAKE, "hours_left": None, "raw": ""
+        }
     try:
         # Time remaining
         hours_left   = None
@@ -2395,3 +2428,4 @@ if __name__ == "__main__":
         scheduler.start()
     except (KeyboardInterrupt, SystemExit):
         logger.info("Bot stopped.")
+
