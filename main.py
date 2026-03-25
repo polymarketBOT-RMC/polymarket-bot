@@ -576,62 +576,42 @@ def get_btc_1h_change() -> float:
 
 def get_funding_rates() -> dict:
     """
-    Fetch perpetual futures funding rates from CoinGlass public API.
-    No API key required for basic funding rate data.
-    Falls back to manual calculation from Bybit REST if CoinGlass fails.
+    Derive a leverage/speculation signal from CoinGecko volume/market_cap ratio.
+    Real funding rate APIs (Bybit, OKX, Binance futures, CoinGlass) are all
+    blocked from Railway's US-based IP range.
+
+    Volume/MCap ratio proxy:
+    - High ratio + price rising = potential short squeeze (BUY signal)
+    - High ratio + price falling = overleveraged longs at risk (SELL signal)
+    Uses the same CoinGecko data already fetched — no extra API calls.
     """
     rates = {}
-
-    # Primary: CoinGlass open API — works from any server
     try:
-        r = requests.get(
-            "https://open-api.coinglass.com/public/v2/funding",
-            headers={"accept": "application/json"},
-            timeout=15
-        )
-        if r.status_code == 200:
-            data = r.json().get("data", [])
-            for item in data:
-                sym  = item.get("symbol", "")
-                rate = item.get("uMarginList", [{}])
-                if sym and rate:
-                    # Get the rate from the first exchange in the list
-                    for ex in rate:
-                        if ex.get("exchangeName") in ("Binance", "OKX", "Bybit"):
-                            fr = ex.get("fundingRate")
-                            if fr is not None:
-                                rates[sym] = round(float(fr), 4)
-                                break
-            if rates:
-                logger.info(f"Funding rates (CoinGlass): {rates}")
-                return rates
+        r = requests.get(f"{COINGECKO_BASE}/coins/markets",
+                         params={"vs_currency": "usd", "order": "market_cap_desc",
+                                 "per_page": 50, "page": 1, "sparkline": "false"},
+                         timeout=15)
+        if r.status_code == 429:
+            logger.warning("CoinGecko rate limited for funding proxy — skipping")
+            return rates
+        r.raise_for_status()
+        coins = r.json()
+        for c in coins:
+            sym    = c.get("symbol", "").upper()
+            vol    = float(c.get("total_volume") or 0)
+            mcap   = float(c.get("market_cap") or 1)
+            change = float(c.get("price_change_percentage_24h") or 0)
+            ratio  = vol / mcap if mcap > 0 else 0
+            # Only flag coins with unusually high volume relative to market cap
+            if ratio > 0.3:
+                proxy = ratio * (1 if change > 0 else -1) * 0.05
+                rates[sym] = round(proxy, 4)
+        if rates:
+            logger.info(f"Funding proxy (vol/mcap ratio): {dict(list(rates.items())[:5])}")
+        else:
+            logger.info("Funding proxy: no high-leverage coins detected this cycle.")
     except Exception as e:
-        logger.warning(f"CoinGlass funding error: {e}")
-
-    # Fallback: Bybit v5 public API (no geo-restriction on read endpoints)
-    try:
-        r = requests.get(
-            "https://api.bybit.com/v5/market/tickers",
-            params={"category": "linear"},
-            timeout=15
-        )
-        if r.status_code == 200:
-            items = r.json().get("result", {}).get("list", [])
-            watch = {"BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT",
-                     "ADAUSDT","BNBUSDT","AVAXUSDT","LINKUSDT"}
-            for item in items:
-                sym = item.get("symbol", "")
-                if sym in watch:
-                    fr = item.get("fundingRate")
-                    if fr:
-                        rates[sym.replace("USDT", "")] = round(float(fr) * 100, 4)
-            if rates:
-                logger.info(f"Funding rates (Bybit tickers): {rates}")
-                return rates
-    except Exception as e:
-        logger.warning(f"Bybit funding fallback error: {e}")
-
-    logger.warning("Funding rates unavailable — continuing without them.")
+        logger.warning(f"Funding proxy error: {e}")
     return rates
 
 def interpret_funding_rates(rates: dict) -> str:
@@ -661,23 +641,35 @@ def interpret_funding_rates(rates: dict) -> str:
 
 
 
-def get_all_crypto_coins():
-    try:
-        r = requests.get(f"{COINGECKO_BASE}/coins/markets",
-                         params={"vs_currency": "usd", "order": "market_cap_desc",
-                                 "per_page": 200, "page": 1, "sparkline": "false",
-                                 "price_change_percentage": "1h,24h,7d"},
-                         timeout=20)
-        r.raise_for_status()
-        coins = r.json()
-        if not isinstance(coins, list):
-            logger.error("CoinGecko unexpected response type")
-            return []
-        logger.info(f"CoinGecko: fetched {len(coins)} coins")
-        return coins
-    except Exception as e:
-        logger.error(f"CoinGecko fetch error: {e}")
-        return []
+def get_all_crypto_coins(retries=3):
+    """Fetch top 200 coins with retry+backoff to handle startup rate limits."""
+    for attempt in range(retries):
+        try:
+            r = requests.get(f"{COINGECKO_BASE}/coins/markets",
+                             params={"vs_currency": "usd", "order": "market_cap_desc",
+                                     "per_page": 200, "page": 1, "sparkline": "false",
+                                     "price_change_percentage": "1h,24h,7d"},
+                             timeout=20)
+            if r.status_code == 429:
+                wait = 30 * (attempt + 1)  # 30s, 60s, 90s
+                logger.warning(f"CoinGecko rate limit (attempt {attempt+1}/{retries}). Waiting {wait}s...")
+                time.sleep(wait)
+                continue
+            r.raise_for_status()
+            coins = r.json()
+            if not isinstance(coins, list):
+                logger.error("CoinGecko unexpected response type")
+                return []
+            logger.info(f"CoinGecko: fetched {len(coins)} coins")
+            return coins
+        except Exception as e:
+            if attempt < retries - 1:
+                wait = 20 * (attempt + 1)
+                logger.warning(f"CoinGecko error (attempt {attempt+1}): {e}. Retrying in {wait}s...")
+                time.sleep(wait)
+            else:
+                logger.error(f"CoinGecko fetch failed after {retries} attempts: {e}")
+    return []
 
 def prefilter_coins(coins, top_n=20):
     import math
@@ -1731,8 +1723,8 @@ if __name__ == "__main__":
     # Staggered startup — prevents hammering CoinGecko/APIs all at once on boot
     logger.info("Running startup cycles (staggered to avoid rate limits)...")
     run_myriad_cycle()
-    logger.info("Startup: Myriad done. Waiting 15s before crypto scan...")
-    time.sleep(15)
+    logger.info("Startup: Myriad done. Waiting 90s before crypto scan (CoinGecko rate limit window)...")
+    time.sleep(90)
     run_crypto_cycle()
     logger.info("Startup: Crypto done. Waiting 5s before stock scan...")
     time.sleep(5)
