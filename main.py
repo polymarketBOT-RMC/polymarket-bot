@@ -744,9 +744,35 @@ FORM_HTML = """
 """
 
 # ── JSONBin helpers ─────────────────────────────────────────────────────────
+def _jsonbin_get(url):
+    """GET with 20s timeout and one retry on timeout."""
+    for attempt in range(2):
+        try:
+            r = requests.get(url, headers=JSONBIN_HEADERS, timeout=20)
+            return r
+        except requests.exceptions.Timeout:
+            if attempt == 0:
+                logger.warning("JSONBin GET timeout — retrying once")
+                time.sleep(3)
+            else:
+                raise
+
+def _jsonbin_put(url, payload):
+    """PUT with 20s timeout and one retry on timeout."""
+    for attempt in range(2):
+        try:
+            r = requests.put(url, headers=JSONBIN_HEADERS, json=payload, timeout=20)
+            return r
+        except requests.exceptions.Timeout:
+            if attempt == 0:
+                logger.warning("JSONBin PUT timeout — retrying once")
+                time.sleep(3)
+            else:
+                raise
+
 def load_positions():
     try:
-        r = requests.get(JSONBIN_URL, headers=JSONBIN_HEADERS, timeout=10)
+        r = _jsonbin_get(JSONBIN_URL)
         if r.status_code == 200:
             return r.json().get("record", {}).get("positions", [])
     except Exception as e:
@@ -755,8 +781,7 @@ def load_positions():
 
 def save_positions(positions):
     try:
-        r = requests.put(JSONBIN_URL, headers=JSONBIN_HEADERS,
-                         json={"positions": positions}, timeout=10)
+        r = _jsonbin_put(JSONBIN_URL, {"positions": positions})
         return r.status_code == 200
     except Exception as e:
         logger.error(f"Save positions error: {e}")
@@ -764,7 +789,7 @@ def save_positions(positions):
 
 def load_history():
     try:
-        r = requests.get(JSONBIN_HISTORY_URL, headers=JSONBIN_HEADERS, timeout=10)
+        r = _jsonbin_get(JSONBIN_HISTORY_URL)
         if r.status_code == 200:
             return r.json().get("record", {}).get("trades", [])
     except Exception as e:
@@ -773,8 +798,7 @@ def load_history():
 
 def save_history(trades):
     try:
-        r = requests.put(JSONBIN_HISTORY_URL, headers=JSONBIN_HEADERS,
-                         json={"trades": trades}, timeout=10)
+        r = _jsonbin_put(JSONBIN_HISTORY_URL, {"trades": trades})
         return r.status_code == 200
     except Exception as e:
         logger.error(f"Save history error: {e}")
@@ -1929,16 +1953,29 @@ def fetch_metaculus_questions() -> list:
     if now - _metaculus_cache["ts"] < 3600:
         return _metaculus_cache["questions"]
     try:
-        r = requests.get("https://www.metaculus.com/api2/questions/",
-                         params={"status": "open", "limit": 200},
-                         timeout=15)
+        # Try v3 API first (newer, more permissive), fall back to v2
+        for api_url, params in [
+            ("https://www.metaculus.com/api/v3/posts/",
+             {"status": "open", "forecast_type": "binary", "limit": 200}),
+            ("https://www.metaculus.com/api2/questions/",
+             {"status": "open", "limit": 200}),
+        ]:
+            try:
+                r = requests.get(api_url, params=params, timeout=15)
+                if r.status_code == 200:
+                    break
+            except Exception:
+                pass
+        else:
+            raise Exception("All Metaculus endpoints failed")
         r.raise_for_status()
-        data      = r.json()
-        all_qs    = data.get("results", []) if isinstance(data, dict) else []
-        # Filter to binary (yes/no) questions only — Metaculus also has continuous/date types
+        data   = r.json()
+        all_qs = data.get("results", []) if isinstance(data, dict) else []
+        # Filter to binary (yes/no) — Metaculus also has continuous/date question types
         questions = [q for q in all_qs
                      if q.get("possibilities", {}).get("type") in ("binary", "vote")
                      or q.get("question_type") == "binary"
+                     or q.get("type") == "binary"
                      or "community_prediction" in q]
         _metaculus_cache["ts"]        = now
         _metaculus_cache["questions"] = questions
