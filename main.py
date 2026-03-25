@@ -576,62 +576,62 @@ def get_btc_1h_change() -> float:
 
 def get_funding_rates() -> dict:
     """
-    Fetch perpetual futures funding rates — a leading indicator for crypto squeezes.
-    Very negative rates = shorts paying longs = short squeeze imminent (BUY signal).
-    Very positive rates = longs paying shorts = long flush risk (SELL signal).
-
-    Uses OKX public API — no API key, no US IP geo-restriction on public market data.
-    Falls back to Bybit public API if OKX fails.
+    Fetch perpetual futures funding rates from CoinGlass public API.
+    No API key required for basic funding rate data.
+    Falls back to manual calculation from Bybit REST if CoinGlass fails.
     """
     rates = {}
-    symbols_map = {
-        "BTC-USDT-SWAP": "BTC", "ETH-USDT-SWAP": "ETH", "SOL-USDT-SWAP": "SOL",
-        "BNB-USDT-SWAP": "BNB", "XRP-USDT-SWAP": "XRP", "ADA-USDT-SWAP": "ADA",
-        "AVAX-USDT-SWAP": "AVAX", "DOT-USDT-SWAP": "DOT", "LINK-USDT-SWAP": "LINK",
-    }
 
-    # Primary: OKX public funding rate endpoint
+    # Primary: CoinGlass open API — works from any server
     try:
         r = requests.get(
-            "https://www.okx.com/api/v5/public/funding-rate-summary",
+            "https://open-api.coinglass.com/public/v2/funding",
+            headers={"accept": "application/json"},
             timeout=15
         )
         if r.status_code == 200:
             data = r.json().get("data", [])
             for item in data:
-                inst = item.get("instId", "")
-                if inst in symbols_map:
-                    rate = float(item.get("fundingRate", 0)) * 100
-                    rates[symbols_map[inst]] = round(rate, 4)
+                sym  = item.get("symbol", "")
+                rate = item.get("uMarginList", [{}])
+                if sym and rate:
+                    # Get the rate from the first exchange in the list
+                    for ex in rate:
+                        if ex.get("exchangeName") in ("Binance", "OKX", "Bybit"):
+                            fr = ex.get("fundingRate")
+                            if fr is not None:
+                                rates[sym] = round(float(fr), 4)
+                                break
             if rates:
-                logger.info(f"Funding rates (OKX): {rates}")
+                logger.info(f"Funding rates (CoinGlass): {rates}")
                 return rates
-    except Exception:
-        pass
-
-    # Fallback: Bybit public funding rates
-    try:
-        bybit_symbols = ["BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT","ADAUSDT","LINKUSDT"]
-        for sym in bybit_symbols:
-            r = requests.get(
-                "https://api.bybit.com/v5/market/funding/history",
-                params={"category": "linear", "symbol": sym, "limit": 1},
-                timeout=10
-            )
-            if r.status_code == 200:
-                items = r.json().get("result", {}).get("list", [])
-                if items:
-                    rate = float(items[0].get("fundingRate", 0)) * 100
-                    clean = sym.replace("USDT", "")
-                    rates[clean] = round(rate, 4)
-            time.sleep(0.3)
-        if rates:
-            logger.info(f"Funding rates (Bybit fallback): {rates}")
-            return rates
     except Exception as e:
-        logger.error(f"Funding rate fallback error: {e}")
+        logger.warning(f"CoinGlass funding error: {e}")
 
-    logger.warning("Funding rates unavailable from all sources this cycle.")
+    # Fallback: Bybit v5 public API (no geo-restriction on read endpoints)
+    try:
+        r = requests.get(
+            "https://api.bybit.com/v5/market/tickers",
+            params={"category": "linear"},
+            timeout=15
+        )
+        if r.status_code == 200:
+            items = r.json().get("result", {}).get("list", [])
+            watch = {"BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT",
+                     "ADAUSDT","BNBUSDT","AVAXUSDT","LINKUSDT"}
+            for item in items:
+                sym = item.get("symbol", "")
+                if sym in watch:
+                    fr = item.get("fundingRate")
+                    if fr:
+                        rates[sym.replace("USDT", "")] = round(float(fr) * 100, 4)
+            if rates:
+                logger.info(f"Funding rates (Bybit tickers): {rates}")
+                return rates
+    except Exception as e:
+        logger.warning(f"Bybit funding fallback error: {e}")
+
+    logger.warning("Funding rates unavailable — continuing without them.")
     return rates
 
 def interpret_funding_rates(rates: dict) -> str:
@@ -758,15 +758,19 @@ def build_crypto_summaries_concurrent(top_coins: list) -> list:
             "weekly_trend":   weekly_trend,
         })
 
-    # Pre-score with what we have — only fetch OHLC for coins scoring >= 1
-    # This massively reduces OHLC calls (usually 2-4 instead of 12-20)
+    # Pre-score with what we have — only fetch OHLC for the strongest candidates
+    # Cap at 6 coins max and require score >= 2 to minimise OHLC API calls
     needs_ohlc = []
     for s in summaries:
         rough_score = compute_conviction_score(s, 0.0, 50, "BUY" if s["change_24h_pct"] < 0 else "SELL")
-        if rough_score >= 1:
-            needs_ohlc.append(s)
+        if rough_score >= 2:
+            needs_ohlc.append((rough_score, s))
 
-    logger.info(f"Fetching OHLC sequentially for {len(needs_ohlc)} qualifying coins (3s gap each)...")
+    # Sort by score descending — fetch OHLC for the best candidates first
+    needs_ohlc.sort(key=lambda x: x[0], reverse=True)
+    needs_ohlc = [s for _, s in needs_ohlc[:6]]  # max 6 OHLC calls per cycle
+
+    logger.info(f"Fetching OHLC sequentially for {len(needs_ohlc)} top candidates (7s gap)...")
     for s in needs_ohlc:
         ohlc = get_coin_ohlc_sequential(s["coin_id"])
         rsi  = ohlc.get("rsi_14")
@@ -777,7 +781,7 @@ def build_crypto_summaries_concurrent(top_coins: list) -> list:
         if sma50:
             s["sma_50"]  = sma50
             s["vs_sma50"]= "above" if s["price"] > sma50 else "below"
-        time.sleep(3)  # 3-second gap — well within CoinGecko free tier limits
+        time.sleep(7)  # 7-second gap — stays well within CoinGecko free tier
 
     return summaries
 
