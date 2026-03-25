@@ -1950,10 +1950,13 @@ def filter_and_research_markets(thin_markets: list, liquid_markets: list):
         expires = m.get("expiresAt", "")
 
         logger.info(f"  Researching: {q[:50]}...")
+        _call_start = time.time()
         research = research_market(q, y_price, side, ret, expires,
                                    known_poly_price=m.get("_poly_price"))
         m["_research"] = research
-        time.sleep(35)  # 35s gap — keeps sequential calls >60s apart, avoids 30k token/min limit
+        _elapsed = time.time() - _call_start
+        if _elapsed < 65:
+            time.sleep(65 - _elapsed)  # ensure 65s between call starts — avoids 30k token/min limit
 
         # Price staleness check — re-fetch live price; abort if it moved >5pp during research
         entry_p = m.get("_entry_price", 0.5)
@@ -1983,10 +1986,13 @@ def filter_and_research_markets(thin_markets: list, liquid_markets: list):
         expires = m.get("expiresAt", "")
 
         logger.info(f"  Researching liquid: {q[:50]}...")
+        _call_start = time.time()
         research = research_market(q, y_price, side, ret, expires,
                                    known_poly_price=m.get("_poly_price"))
         m["_research"] = research
-        time.sleep(20)
+        _elapsed = time.time() - _call_start
+        if _elapsed < 65:
+            time.sleep(65 - _elapsed)  # ensure 65s between call starts — avoids 30k token/min limit
 
         entry_p = m.get("_entry_price", 0.5)
         fresh_yes, _ = get_myriad_price(str(m.get("id", "")))
