@@ -52,6 +52,13 @@ _polymarket_cache: dict = {"ts": 0.0, "markets": []}
 _manifold_cache:   dict = {"ts": 0.0, "markets": []}
 _metaculus_cache:  dict = {"ts": 0.0, "questions": []}
 
+# ── Anthropic rate limit guard ───────────────────────────────────────────────
+# Tracks when the last research API call completed (wall clock).
+# research_market() waits until 70s have passed since the last call ended,
+# ensuring the 60-second rolling token window has fully cleared.
+_last_research_end: float = 0.0
+RESEARCH_COOLDOWN   = 70   # seconds between end-of-call and start-of-next-call
+
 # ── UPGRADE 1: In-memory deduplication cache ────────────────────────────────
 # Stores {signal_hash: datetime_sent} — resets on restart (acceptable)
 _dedup_cache: dict = {}
@@ -1587,7 +1594,11 @@ def research_market(question: str, current_yes_price: float,
     """
     Single-call research pipeline per market.
     Gated by daily API budget cap — set MAX_RESEARCH_CALLS_PER_DAY env var.
+    Rate-limited internally: waits RESEARCH_COOLDOWN seconds since last call ended
+    before firing, and retries once on 429 with a full cooldown sleep.
     """
+    global _last_research_end
+
     # Check daily budget before making any API call
     if not can_research():
         return {
@@ -1598,6 +1609,16 @@ def research_market(question: str, current_yes_price: float,
             "reasoning": "Budget cap reached for today.",
             "kelly_stake": PAPER_STAKE, "hours_left": None, "raw": ""
         }
+
+    # Rate limit guard — wait until RESEARCH_COOLDOWN seconds since last call ENDED.
+    # Measuring from call-end (not start) ensures the last round-trip's tokens have
+    # fully expired from the 60-second rolling window before we send the next request.
+    since_last = time.time() - _last_research_end
+    if _last_research_end > 0 and since_last < RESEARCH_COOLDOWN:
+        wait = RESEARCH_COOLDOWN - since_last
+        logger.info(f"Rate guard: waiting {wait:.0f}s (last call ended {since_last:.0f}s ago)")
+        time.sleep(wait)
+
     try:
         # Time remaining
         hours_left   = None
@@ -1697,12 +1718,25 @@ def research_market(question: str, current_yes_price: float,
             f"REASONING: [max 1 sentence]"
         )
 
-        resp = client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=1500,
-            tools=[{"type": "web_search_20250305", "name": "web_search"}],
-            messages=[{"role": "user", "content": prompt}]
-        )
+        def _call_api():
+            return client.messages.create(
+                model="claude-sonnet-4-20250514",
+                max_tokens=1500,
+                tools=[{"type": "web_search_20250305", "name": "web_search"}],
+                messages=[{"role": "user", "content": prompt}]
+            )
+
+        try:
+            resp = _call_api()
+        except Exception as first_err:
+            if "429" in str(first_err) or "rate_limit" in str(first_err).lower():
+                logger.warning(f"Rate limit 429 on first attempt — sleeping {RESEARCH_COOLDOWN}s then retrying")
+                time.sleep(RESEARCH_COOLDOWN)
+                resp = _call_api()   # raises if still failing
+            else:
+                raise
+        finally:
+            _last_research_end = time.time()
 
         result_text = ""
         for block in resp.content:
@@ -1741,6 +1775,7 @@ def research_market(question: str, current_yes_price: float,
         }
 
     except Exception as e:
+        _last_research_end = time.time()   # always update so next call doesn't skip the cooldown
         logger.error(f"Research error for '{question[:40]}': {e}")
         return {
             "true_prob": 0.0, "edge_pp": "0", "edge_size": "UNKNOWN",
@@ -1835,8 +1870,8 @@ def fetch_manifold_markets() -> list:
     if now - _manifold_cache["ts"] < 1800:
         return _manifold_cache["markets"]
     try:
-        r = requests.get("https://manifold.markets/api/v0/markets",
-                         params={"limit": 1000, "sort": "activity"},
+        r = requests.get("https://api.manifold.markets/v0/markets",
+                         params={"limit": 1000},
                          timeout=15)
         r.raise_for_status()
         markets = [m for m in r.json()
@@ -1884,12 +1919,16 @@ def fetch_metaculus_questions() -> list:
         return _metaculus_cache["questions"]
     try:
         r = requests.get("https://www.metaculus.com/api2/questions/",
-                         params={"status": "open", "type": "forecast",
-                                 "forecast_type": "binary", "limit": 200},
+                         params={"status": "open", "type": "forecast", "limit": 200},
                          timeout=15)
         r.raise_for_status()
         data      = r.json()
-        questions = data.get("results", []) if isinstance(data, dict) else []
+        all_qs    = data.get("results", []) if isinstance(data, dict) else []
+        # Filter to binary (yes/no) questions only — Metaculus also has continuous/date types
+        questions = [q for q in all_qs
+                     if q.get("possibilities", {}).get("type") in ("binary", "vote")
+                     or q.get("question_type") == "binary"
+                     or "community_prediction" in q]
         _metaculus_cache["ts"]        = now
         _metaculus_cache["questions"] = questions
         logger.info(f"Metaculus API: {len(questions)} open binary questions cached")
@@ -2137,15 +2176,11 @@ def filter_and_research_markets(thin_markets: list, liquid_markets: list):
         expires = m.get("expiresAt", "")
 
         logger.info(f"  Researching: {q[:50]}...")
-        _call_start = time.time()
         research = research_market(q, y_price, side, ret, expires,
                                    known_poly_price=m.get("_poly_price"),
                                    known_manifold_price=m.get("_manifold_price"),
                                    known_metaculus_prob=m.get("_metaculus_prob"))
         m["_research"] = research
-        _elapsed = time.time() - _call_start
-        if _elapsed < 65:
-            time.sleep(65 - _elapsed)  # ensure 65s between call starts — avoids 30k token/min limit
 
         # Price staleness check — re-fetch live price; abort if it moved >5pp during research
         entry_p = m.get("_entry_price", 0.5)
@@ -2175,15 +2210,11 @@ def filter_and_research_markets(thin_markets: list, liquid_markets: list):
         expires = m.get("expiresAt", "")
 
         logger.info(f"  Researching liquid: {q[:50]}...")
-        _call_start = time.time()
         research = research_market(q, y_price, side, ret, expires,
                                    known_poly_price=m.get("_poly_price"),
                                    known_manifold_price=m.get("_manifold_price"),
                                    known_metaculus_prob=m.get("_metaculus_prob"))
         m["_research"] = research
-        _elapsed = time.time() - _call_start
-        if _elapsed < 65:
-            time.sleep(65 - _elapsed)  # ensure 65s between call starts — avoids 30k token/min limit
 
         entry_p = m.get("_entry_price", 0.5)
         fresh_yes, _ = get_myriad_price(str(m.get("id", "")))
