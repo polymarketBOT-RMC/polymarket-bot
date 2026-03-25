@@ -165,7 +165,7 @@ def log_signal(identifier: str, signal_type: str, direction: str,
     except Exception as e:
         logger.error(f"Log signal error: {e}")
 
-def check_paper_trade_outcomes():
+def check_paper_trade_outcomes(force_email=False):
     """
     Auto-check outcomes for all open paper trades.
     For Myriad: fetch current market price and calculate unrealised P&L.
@@ -246,11 +246,11 @@ def check_paper_trade_outcomes():
         if updates:
             save_history(history)
 
-        # Send report if there are resolved trades or significant open positions
+        # Send report only if trades resolved THIS cycle, or forced (Mon/Thu job), or 3+ open positions
         all_trades    = [h for h in history if h.get("type") == "paper_trade"]
         resolved_all  = [h for h in all_trades if h.get("resolved")]
 
-        if resolved_all or (open_pnl and len(open_pnl) >= 3):
+        if force_email or resolved or (open_pnl and len(open_pnl) >= 3):
             send_track_record_email(all_trades, resolved_all, open_pnl)
 
     except Exception as e:
@@ -710,7 +710,8 @@ def close_position(pos, exit_price):
     else:
         shares     = float(pos.get("shares", 0))
         pnl_dollar = shares * (exit_price - entry) if side == "BUY" else shares * (entry - exit_price)
-    pnl_pct = ((exit_price - entry) / entry * 100) if side == "BUY" else ((entry - exit_price) / entry * 100)
+    is_long = side in ("BUY", "YES")
+    pnl_pct = ((exit_price - entry) / entry * 100) if is_long else ((entry - exit_price) / entry * 100)
     closed = dict(pos)
     closed.update({
         "exit_price": exit_price,
@@ -1743,6 +1744,7 @@ def analyze_myriad(thin_researched, liquid_researched):
         block = "\n".join([
             f"ALERT: {m.get('title','?')}",
             f"MARKET URL: {url}",
+            f"MARKET ID: {mkt_id}",
             f"MARKET TIER: {tier}",
             f"VOLUME: ${float(vol or 0):.0f}",
             f"TIME REMAINING: {time_str}",
@@ -1868,7 +1870,8 @@ def run_myriad_cycle():
                     pass
 
             research_note = research_line[0].replace("KEY FINDING:","").strip() if research_line else ""
-            mkt_id = mkt_url_line[0].replace("MARKET URL:","").strip().split("/")[-1] if mkt_url_line else ""
+            mkt_id_line   = [l for l in block.splitlines() if l.startswith("MARKET ID:")]
+            mkt_id = mkt_id_line[0].replace("MARKET ID:","").strip() if mkt_id_line else ""
 
             # Auto-log paper trade with full research context
             log_signal(
@@ -2412,13 +2415,9 @@ if __name__ == "__main__":
     scheduler.add_job(run_myriad_cycle,       "interval", minutes=CHECK_INTERVAL_MINUTES)
     scheduler.add_job(run_crypto_cycle,       "interval", minutes=CHECK_INTERVAL_MINUTES)
     scheduler.add_job(run_stock_cycle,        "cron",     hour=STOCK_SCAN_HOUR_UTC, minute=0)
-    scheduler.add_job(check_signal_outcomes,       "interval", hours=6)
     scheduler.add_job(check_paper_trade_outcomes, "interval", hours=4)
-    scheduler.add_job(lambda: send_track_record_email(
-        [h for h in load_history() if h.get("type")=="paper_trade"],
-        [h for h in load_history() if h.get("type")=="paper_trade" and h.get("resolved")],
-        []
-    ), "cron", day_of_week="mon,thu", hour=8, minute=0)  # Mon+Thu 8am UTC = 3pm Bangkok
+    scheduler.add_job(lambda: check_paper_trade_outcomes(force_email=True),
+                      "cron", day_of_week="mon,thu", hour=8, minute=0)  # Mon+Thu 8am UTC = 3pm Bangkok
     scheduler.add_job(lambda: send_report("daily"),   "cron", hour=23, minute=0)
     scheduler.add_job(lambda: send_report("weekly"),  "cron", day_of_week="mon", hour=23, minute=30)
     scheduler.add_job(lambda: send_report("monthly"), "cron", day=1, hour=23, minute=45)
