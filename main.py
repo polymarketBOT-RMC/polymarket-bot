@@ -579,27 +579,59 @@ def get_funding_rates() -> dict:
     Fetch perpetual futures funding rates — a leading indicator for crypto squeezes.
     Very negative rates = shorts paying longs = short squeeze imminent (BUY signal).
     Very positive rates = longs paying shorts = long flush risk (SELL signal).
-    Uses Binance futures public endpoint — no API key, no geo restriction on futures data.
+
+    Uses OKX public API — no API key, no US IP geo-restriction on public market data.
+    Falls back to Bybit public API if OKX fails.
     """
     rates = {}
+    symbols_map = {
+        "BTC-USDT-SWAP": "BTC", "ETH-USDT-SWAP": "ETH", "SOL-USDT-SWAP": "SOL",
+        "BNB-USDT-SWAP": "BNB", "XRP-USDT-SWAP": "XRP", "ADA-USDT-SWAP": "ADA",
+        "AVAX-USDT-SWAP": "AVAX", "DOT-USDT-SWAP": "DOT", "LINK-USDT-SWAP": "LINK",
+    }
+
+    # Primary: OKX public funding rate endpoint
     try:
         r = requests.get(
-            "https://fapi.binance.com/fapi/v1/premiumIndex",
+            "https://www.okx.com/api/v5/public/funding-rate-summary",
             timeout=15
         )
         if r.status_code == 200:
-            watch = {"BTCUSDT","ETHUSDT","SOLUSDT","BNBUSDT","XRPUSDT",
-                     "ADAUSDT","AVAXUSDT","DOTUSDT","LINKUSDT","MATICUSDT"}
-            for item in r.json():
-                sym = item.get("symbol", "")
-                if sym in watch:
-                    rate = float(item.get("lastFundingRate", 0)) * 100
-                    rates[sym.replace("USDT", "")] = round(rate, 4)
-            logger.info(f"Funding rates: {rates}")
-        else:
-            logger.warning(f"Binance futures API returned {r.status_code}")
+            data = r.json().get("data", [])
+            for item in data:
+                inst = item.get("instId", "")
+                if inst in symbols_map:
+                    rate = float(item.get("fundingRate", 0)) * 100
+                    rates[symbols_map[inst]] = round(rate, 4)
+            if rates:
+                logger.info(f"Funding rates (OKX): {rates}")
+                return rates
+    except Exception:
+        pass
+
+    # Fallback: Bybit public funding rates
+    try:
+        bybit_symbols = ["BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT","ADAUSDT","LINKUSDT"]
+        for sym in bybit_symbols:
+            r = requests.get(
+                "https://api.bybit.com/v5/market/funding/history",
+                params={"category": "linear", "symbol": sym, "limit": 1},
+                timeout=10
+            )
+            if r.status_code == 200:
+                items = r.json().get("result", {}).get("list", [])
+                if items:
+                    rate = float(items[0].get("fundingRate", 0)) * 100
+                    clean = sym.replace("USDT", "")
+                    rates[clean] = round(rate, 4)
+            time.sleep(0.3)
+        if rates:
+            logger.info(f"Funding rates (Bybit fallback): {rates}")
+            return rates
     except Exception as e:
-        logger.error(f"Funding rate error: {e}")
+        logger.error(f"Funding rate fallback error: {e}")
+
+    logger.warning("Funding rates unavailable from all sources this cycle.")
     return rates
 
 def interpret_funding_rates(rates: dict) -> str:
@@ -1687,13 +1719,19 @@ if __name__ == "__main__":
     logger.info(f"Myriad + Crypto: every {CHECK_INTERVAL_MINUTES} min")
     logger.info(f"Stocks: daily at {STOCK_SCAN_HOUR_UTC}:00 UTC (6am Bangkok)")
     logger.info(f"Stock watchlist: {STOCK_WATCHLIST}")
-    logger.info("Upgrades active: dedup | fear&greed | concurrent | waitress | conviction | btc-filter | outcomes | weekly-trend")
+    logger.info("Upgrades active: dedup | fear&greed | funding-rates | thin-markets | "
+                "waitress | conviction | btc-filter | outcomes | weekly-trend")
 
     threading.Thread(target=run_flask, daemon=True).start()
 
-    # Run all cycles immediately on startup
+    # Staggered startup — prevents hammering CoinGecko/APIs all at once on boot
+    logger.info("Running startup cycles (staggered to avoid rate limits)...")
     run_myriad_cycle()
+    logger.info("Startup: Myriad done. Waiting 15s before crypto scan...")
+    time.sleep(15)
     run_crypto_cycle()
+    logger.info("Startup: Crypto done. Waiting 5s before stock scan...")
+    time.sleep(5)
     run_stock_cycle()
     check_signal_outcomes()
 
