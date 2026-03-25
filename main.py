@@ -257,6 +257,55 @@ def check_paper_trade_outcomes(force_email=False):
         logger.error(f"Paper trade outcome check error: {e}")
 
 
+def _build_calibration_html(resolved_trades: list) -> str:
+    """
+    Show whether Claude's probability estimates are calibrated.
+    Buckets resolved trades by estimated true probability and compares to actual win rate.
+    If Claude says 70% and things only win 40% of the time, signals are overconfident.
+    """
+    buckets = [
+        ("30–40%", 30, 40), ("40–50%", 40, 50), ("50–60%", 50, 60),
+        ("60–70%", 60, 70), ("70%+",   70, 101),
+    ]
+    rows = ""
+    any_data = False
+    for label, lo, hi in buckets:
+        trades = [t for t in resolved_trades
+                  if lo <= float(t.get("true_prob_est", 0) or 0) < hi]
+        if not trades:
+            continue
+        any_data = True
+        wins      = sum(1 for t in trades if t.get("outcome") == "WIN")
+        actual    = round(wins / len(trades) * 100)
+        mid       = (lo + hi) // 2 if hi < 101 else 75
+        diff      = actual - mid
+        diff_col  = "#2d6a4f" if diff >= -5 else "#e63946"
+        rows += (
+            f'<tr style="border-bottom:1px solid #eee">'
+            f'<td style="padding:6px;text-align:center">{label}</td>'
+            f'<td style="padding:6px;text-align:center">{len(trades)}</td>'
+            f'<td style="padding:6px;text-align:center">{wins}</td>'
+            f'<td style="padding:6px;text-align:center;font-weight:bold;color:{diff_col}">{actual}%</td>'
+            f'<td style="padding:6px;text-align:center;color:{diff_col}">{diff:+d}pp</td>'
+            f'</tr>'
+        )
+    if not any_data:
+        return ""
+    return (
+        f'<h3 style="color:#1a1a2e;margin:20px 0 10px">📐 Probability Calibration</h3>'
+        f'<p style="color:#666;font-size:12px;margin-bottom:8px">'
+        f'Are Claude\'s probability estimates accurate? Diff = actual win rate vs mid-bucket estimate.</p>'
+        f'<table style="width:100%;border-collapse:collapse;font-size:13px">'
+        f'<tr style="background:#f0f2ff;font-weight:bold">'
+        f'<th style="padding:6px">Est. Prob</th>'
+        f'<th style="padding:6px">Trades</th>'
+        f'<th style="padding:6px">Wins</th>'
+        f'<th style="padding:6px">Actual %</th>'
+        f'<th style="padding:6px">Diff</th></tr>'
+        f'{rows}</table>'
+    )
+
+
 def send_track_record_email(all_trades, resolved_trades, open_positions):
     """Send a comprehensive track record email."""
     total     = len(all_trades)
@@ -352,6 +401,9 @@ def send_track_record_email(all_trades, resolved_trades, open_positions):
            f'<th style="padding:6px">Now</th>'
            f'<th style="padding:6px">P&L</th></tr>'
            f'{open_rows}</table>' if open_rows else '')
+
+        # Calibration table — only show once we have enough resolved trades
+        + (_build_calibration_html(resolved_trades) if len(resolved_trades) >= 5 else '')
 
         + '<p style="color:#aaa;font-size:11px;margin-top:24px">'
           'Paper trading only — ${:.0f} per signal. Not financial advice.</p>'.format(PAPER_STAKE)
@@ -1292,7 +1344,7 @@ def run_crypto_cycle():
 
         s["conviction_score"] = score
         s["funding_rate"]     = funding_rates.get(coin_sym)
-        if score >= 2:
+        if score >= 4:
             high_conviction.append(s)
 
     if not high_conviction:
@@ -1564,9 +1616,12 @@ def research_market(question: str, current_yes_price: float,
             f"MYRIAD: YES=${current_yes_price:.2f} ({current_yes_price*100:.0f}% implied)\n"
             f"TARGET: BUY {target_side} @ ${entry_price:.2f} = {potential_return:.1f}x return\n"
             f"{time_context}\n\n"
-            f"Do these searches (use web_search tool):\n"
-            f"1. Current status/news for this event\n"
-            f"2. Search 'polymarket {question[:50]}' for cross-market price\n\n"
+            f"Do BOTH of these searches (both required, use web_search tool):\n"
+            f"1. Current status/news for: {question}\n"
+            f"2. Search 'site:polymarket.com {question[:60]}' — find the equivalent Polymarket market "
+            f"and report its current {target_side} price as a decimal (e.g. 0.65).\n\n"
+            f"Myriad implies {entry_price*100:.0f}% for {target_side}. "
+            f"If Polymarket prices {target_side} >10pp higher, that is strong evidence of mispricing.\n\n"
             f"Need >{min_true_prob:.0f}% true probability to recommend BUY.\n\n"
             f"Reply with ONLY these lines:\n"
             f"TRUE_PROBABILITY: [0-100]%\n"
@@ -1574,7 +1629,7 @@ def research_market(question: str, current_yes_price: float,
             f"EDGE_SIZE: [LARGE/MEDIUM/SMALL/NONE]\n"
             f"KEY_FINDING: [1 sentence]\n"
             f"BASE_RATE: [brief or UNKNOWN]\n"
-            f"CROSS_MARKET: [price if found, or not_found]\n"
+            f"CROSS_MARKET: [Polymarket {target_side} price as decimal e.g. 0.65, or not_found]\n"
             f"TRADE_RECOMMENDATION: [BUY {target_side} / SKIP]\n"
             f"CONFIDENCE: [High/Medium/Low]\n"
             f"REASONING: [max 1 sentence]"
@@ -1633,6 +1688,41 @@ def research_market(question: str, current_yes_price: float,
 
 
 
+def _research_confirms_edge(research: dict, side: str, entry_price: float) -> bool:
+    """
+    Decide whether research confirms a genuine edge.
+    If Polymarket has the market:
+      - Gap >10pp vs Myriad = confirmed cross-market mispricing → alert
+      - Gap ≤10pp = Polymarket agrees with Myriad, no edge → skip
+    If Polymarket not found:
+      - Require LARGE edge only (stricter without cross-market confirmation)
+    """
+    if research["recommendation"] != f"BUY {side}":
+        return False
+
+    cross = research.get("cross_market", "not_found").strip().lower()
+    poly_price = None
+    if cross not in ("not_found", "", "n/a", "none", "not found"):
+        try:
+            val = cross.replace("$", "").replace("%", "").split()[0]
+            poly_price = float(val)
+            if poly_price > 1.0:          # expressed as percentage e.g. 65
+                poly_price = poly_price / 100.0
+        except (ValueError, IndexError):
+            poly_price = None
+
+    if poly_price is not None:
+        poly_implied_pct  = poly_price * 100
+        myriad_implied_pct = entry_price * 100
+        gap = poly_implied_pct - myriad_implied_pct
+        logger.info(f"  Cross-market: Polymarket {side}={poly_price:.2f} ({poly_implied_pct:.0f}%) "
+                    f"vs Myriad {myriad_implied_pct:.0f}% → gap {gap:+.1f}pp")
+        return gap > 10.0   # confirmed mispricing
+    else:
+        # No Polymarket equivalent — require LARGE edge without cross-market backup
+        return research["edge_size"] == "LARGE"
+
+
 def filter_and_research_markets(thin_markets: list, liquid_markets: list):
     """
     Full pipeline:
@@ -1663,11 +1753,12 @@ def filter_and_research_markets(thin_markets: list, liquid_markets: list):
         m["_research"] = research
         time.sleep(20)  # 20s gap = ~3 calls/min = well within 30k token/min limit
 
-        if research["recommendation"] == f"BUY {side}" and research["edge_size"] in ("LARGE","MEDIUM"):
+        entry_p = m.get("_entry_price", 0.5)
+        if _research_confirms_edge(research, side, entry_p):
             researched_thin.append(m)
             logger.info(f"  ✓ CONFIRMED: {q[:40]} | "
                         f"True: {research['true_prob']}% | Edge: {research['edge_size']} | "
-                        f"Kelly stake: ${research['kelly_stake']}")
+                        f"Cross-mkt: {research['cross_market']} | Kelly: ${research['kelly_stake']}")
         else:
             logger.info(f"  ✗ No edge: {q[:40]} | {research['recommendation']} | "
                         f"Edge: {research['edge_size']} | Cross-mkt: {research['cross_market']}")
@@ -1684,7 +1775,8 @@ def filter_and_research_markets(thin_markets: list, liquid_markets: list):
         m["_research"] = research
         time.sleep(20)
 
-        if research["recommendation"] == f"BUY {side}" and research["edge_size"] == "LARGE":
+        entry_p = m.get("_entry_price", 0.5)
+        if _research_confirms_edge(research, side, entry_p):
             researched_liquid.append(m)
 
     total = len(researched_thin) + len(researched_liquid)
@@ -1741,11 +1833,17 @@ def analyze_myriad(thin_researched, liquid_researched):
         time_str     = f"{hours_left/24:.1f} days ({hours_left:.0f}h)" if hours_left else "unknown"
         edge_pp      = r.get("edge_pp", "?")
 
+        liquidity_warning = (
+            f"⚠️ LOW LIQUIDITY — vol ${float(vol or 0):.0f} vs ${kelly_stake:.0f} stake. Price impact risk."
+            if float(vol or 0) < kelly_stake * 10 else ""
+        )
+
         block = "\n".join([
             f"ALERT: {m.get('title','?')}",
             f"MARKET URL: {url}",
             f"MARKET ID: {mkt_id}",
             f"MARKET TIER: {tier}",
+            f"LIQUIDITY WARNING: {liquidity_warning}",
             f"VOLUME: ${float(vol or 0):.0f}",
             f"TIME REMAINING: {time_str}",
             f"CURRENT ODDS: YES = ${yes_p} / NO = ${no_p}",
@@ -2067,7 +2165,7 @@ def send_myriad_email(analysis):
                            "CURRENT ODDS","SUGGESTED PLAY","POTENTIAL RETURN",
                            "MARKET IMPLIES","RESEARCH ESTIMATE","EDGE","BASE RATE",
                            "CROSS-MARKET","KEY FINDING","REASONING","EXPECTED VALUE",
-                           "KELLY STAKE","EDGE TYPE","CONFIDENCE"]:
+                           "KELLY STAKE","EDGE TYPE","CONFIDENCE","LIQUIDITY WARNING"]:
                 if line.startswith(prefix + ":"):
                     fields[prefix] = line.replace(prefix + ":", "").strip()
 
@@ -2122,6 +2220,10 @@ def send_myriad_email(analysis):
             f'<p style="margin:4px 0;font-size:13px"><strong>💰 Kelly Stake:</strong> {fields.get("KELLY STAKE","?")}</p>'
             f'<p style="margin:4px 0;font-size:13px"><strong>Confidence:</strong> '
             f'<span style="color:{conf_col};font-weight:bold">{conf}</span></p>'
+            + (f'<p style="margin:8px 0;background:#fff3cd;border-left:3px solid #f4a261;'
+               f'padding:8px;border-radius:4px;font-size:13px;font-weight:bold">'
+               f'{fields["LIQUIDITY WARNING"]}</p>'
+               if fields.get("LIQUIDITY WARNING") else '')
         )
 
         trade_btn = (
