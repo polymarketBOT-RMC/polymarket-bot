@@ -900,30 +900,89 @@ def get_all_crypto_coins(retries=3):
                 logger.error(f"CoinGecko fetch failed after {retries} attempts: {e}")
     return []
 
+def detect_accumulation(coin: dict) -> str:
+    """
+    Detect smart money accumulation vs distribution pattern.
+    Uses price change vs volume relationship:
+    - ACCUMULATION: price stable or slightly down, but volume spiking = smart money buying quietly
+    - DISTRIBUTION: price stable or slightly up, volume spiking = smart money selling into strength
+    - MOMENTUM: price up + volume up = genuine trend
+    - CAPITULATION: price down hard + volume spike = potential bottom (contrarian BUY)
+    """
+    try:
+        change_24h = float(coin.get("price_change_percentage_24h") or 0)
+        change_7d  = float(coin.get("price_change_percentage_7d_in_currency") or
+                           coin.get("price_change_percentage_7d") or 0)
+        vol        = float(coin.get("total_volume") or 0)
+        mcap       = float(coin.get("market_cap") or 1)
+        vol_ratio  = vol / mcap if mcap > 0 else 0
+
+        if vol_ratio > 0.4 and -3 < change_24h < 3 and change_7d < -5:
+            return "ACCUMULATION"   # high vol, flat price, in downtrend = quiet buying
+        elif vol_ratio > 0.4 and -3 < change_24h < 5 and change_7d > 10:
+            return "DISTRIBUTION"   # high vol, flat price, in uptrend = selling into strength
+        elif change_24h > 5 and vol_ratio > 0.3:
+            return "MOMENTUM"       # price up + volume = real move
+        elif change_24h < -10 and vol_ratio > 0.4:
+            return "CAPITULATION"   # crash + high vol = potential bottom
+        elif change_24h < -5 and vol_ratio < 0.1:
+            return "BLEED"          # slow decline, low vol = no buyers yet
+        else:
+            return "NEUTRAL"
+    except Exception:
+        return "NEUTRAL"
+
+
 def prefilter_coins(coins, top_n=20):
     import math
     valid = [c for c in coins if isinstance(c, dict) and c.get("current_price", 0) > 0]
+
+    # Add accumulation signal to each coin
+    for c in valid:
+        c["_pattern"] = detect_accumulation(c)
+
     scored = []
     for c in valid:
         try:
-            change = abs(float(c.get("price_change_percentage_24h") or 0))
-            volume = float(c.get("total_volume") or 0)
-            score  = change * math.log10(max(volume, 1))
-            scored.append((score, c))
+            change    = abs(float(c.get("price_change_percentage_24h") or 0))
+            volume    = float(c.get("total_volume") or 0)
+            base_score= change * math.log10(max(volume, 1))
+
+            # Boost accumulation and capitulation patterns — these are the real signals
+            pattern_boost = {
+                "ACCUMULATION": 2.0,
+                "CAPITULATION": 1.8,
+                "MOMENTUM":     1.3,
+                "DISTRIBUTION": 1.2,
+                "NEUTRAL":      1.0,
+                "BLEED":        0.8,
+            }.get(c.get("_pattern","NEUTRAL"), 1.0)
+
+            scored.append((base_score * pattern_boost, c))
         except Exception:
             continue
+
     scored.sort(key=lambda x: x[0], reverse=True)
     top_movers = [c for _, c in scored[:8]]
-    gainers    = sorted(valid, key=lambda c: float(c.get("price_change_percentage_24h") or 0), reverse=True)[:6]
-    losers     = sorted(valid, key=lambda c: float(c.get("price_change_percentage_24h") or 0))[:6]
+
+    # Always include any accumulation/capitulation patterns found
+    special = [c for c in valid if c.get("_pattern") in ("ACCUMULATION","CAPITULATION")
+               and c not in top_movers][:4]
+
+    gainers = sorted(valid, key=lambda c: float(c.get("price_change_percentage_24h") or 0), reverse=True)[:4]
+    losers  = sorted(valid, key=lambda c: float(c.get("price_change_percentage_24h") or 0))[:4]
+
     seen, result = set(), []
-    for c in top_movers + gainers + losers:
+    for c in top_movers + special + gainers + losers:
         cid = c.get("id", "")
         if cid not in seen:
             seen.add(cid)
             result.append(c)
         if len(result) >= top_n:
             break
+
+    patterns = {c.get("_pattern","?") for c in result}
+    logger.info(f"Pre-filtered {len(result)} coins | patterns found: {patterns}")
     return result[:top_n]
 
 def get_coin_ohlc_sequential(coin_id: str) -> dict:
@@ -977,6 +1036,7 @@ def build_crypto_summaries_concurrent(top_coins: list) -> list:
             "sma_50":         None,
             "vs_sma50":       "unknown",
             "weekly_trend":   weekly_trend,
+        "_pattern":       c.get("_pattern", "NEUTRAL"),
         })
 
     # Pre-score with what we have — only fetch OHLC for the strongest candidates
@@ -1056,10 +1116,21 @@ def analyze_crypto(crypto_data_list, fg: dict, btc_1h_change: float,
     if btc_1h_change < -4:
         btc_warning = f"\n⚠️ BTC dropped {btc_1h_change:.1f}% in the last hour — suppress altcoin BUY signals."
 
+    # Smart money pattern summary
+    accumulating = [d["symbol"] for d in crypto_data_list if d.get("_pattern") == "ACCUMULATION"]
+    capitulating  = [d["symbol"] for d in crypto_data_list if d.get("_pattern") == "CAPITULATION"]
+    distributing  = [d["symbol"] for d in crypto_data_list if d.get("_pattern") == "DISTRIBUTION"]
+
     hint  = f"\nFear & Greed Index: {fg['value']}/100 ({fg['label']})"
     hint += f"\nBTC 1h change: {btc_1h_change:+.2f}%"
     hint += f"\nFunding Rates: {funding_summary}" if funding_summary else ""
     hint += fg_warning + btc_warning
+    if accumulating:
+        hint += f"\n🔍 ACCUMULATION PATTERN (high vol, flat price, downtrend = smart money buying): {', '.join(accumulating)}"
+    if capitulating:
+        hint += f"\n💥 CAPITULATION (crash + high volume = potential bottom): {', '.join(capitulating)}"
+    if distributing:
+        hint += f"\n⚠️ DISTRIBUTION (high vol, flat price, uptrend = selling into strength): {', '.join(distributing)}"
     if oversold:
         hint += f"\nOVERSOLD coins (RSI<32): {', '.join(oversold)}"
     if overbought:
@@ -1077,7 +1148,10 @@ def analyze_crypto(crypto_data_list, fg: dict, btc_1h_change: float,
         "• Funding rate very positive (>+0.10%) = long flush risk → SELL\n"
         "• 24h gain >+7% with volume >$50M = momentum BUY\n"
         "• 24h loss >-8% with RSI<40 = oversold bounce\n"
-        "• Weekly trend UP + price above SMA50 = trend continuation BUY\n\n"
+        "• Weekly trend UP + price above SMA50 = trend continuation BUY\n"
+        "• _pattern == ACCUMULATION = smart money quietly buying = strong BUY signal\n"
+        "• _pattern == CAPITULATION = crash bottom potential = contrarian BUY\n"
+        "• _pattern == DISTRIBUTION = smart money selling = AVOID or SELL\n\n"
         "HARD RULES:\n"
         "• Funding rate signals override RSI — they are leading indicators\n"
         "• If BTC dropped >4% in last hour, suppress all altcoin BUY signals\n"
@@ -1395,80 +1469,180 @@ def prefilter_for_value(markets: list) -> list:
     return candidates
 
 
-def research_market(question: str, current_yes_price: float,
-                    target_side: str, potential_return: float) -> dict:
+def kelly_criterion(true_prob: float, entry_price: float,
+                    max_stake: float = 50.0, min_stake: float = 5.0) -> float:
     """
-    Use Claude with web search to research the ACTUAL probability of this
-    prediction market question. Returns structured research result.
-    This is the core research filter — only well-researched signals get through.
+    Kelly Criterion for binary prediction markets.
+    f* = (p * b - q) / b
+    where b = net odds (payout/stake - 1), p = true prob, q = 1-p
+    Applies half-Kelly for safety (reduces variance).
     """
     try:
+        b = (1.0 / entry_price) - 1.0  # net odds
+        p = true_prob / 100.0
+        q = 1.0 - p
+        if b <= 0 or p <= 0:
+            return min_stake
+        kelly_fraction = (p * b - q) / b
+        half_kelly      = kelly_fraction / 2  # half-Kelly for safety
+        stake           = round(max(min_stake, min(max_stake, half_kelly * 100)), 2)
+        return stake
+    except Exception:
+        return min_stake
+
+
+def get_polymarket_comparison(question: str) -> str:
+    """
+    Search Polymarket and Manifold for the same question.
+    If they price it differently to Myriad, that's a cross-market signal.
+    """
+    try:
+        resp = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=200,
+            tools=[{"type": "web_search_20250305", "name": "web_search"}],
+            messages=[{"role": "user", "content":
+                f"Search Polymarket and Manifold Markets for this question or very similar ones: "
+                f"'{question}'. "
+                f"Report ONLY: the platform name, the YES price, and the URL. "
+                f"If not found on either platform say NOT_FOUND. "
+                f"Format: PLATFORM: [name] | PRICE: [price] | URL: [url]"}]
+        )
+        for block in resp.content:
+            if hasattr(block, "text") and block.text.strip():
+                return block.text.strip()[:200]
+    except Exception:
+        pass
+    return "NOT_FOUND"
+
+
+def research_market(question: str, current_yes_price: float,
+                    target_side: str, potential_return: float,
+                    expires_at: str = "") -> dict:
+    """
+    Deep research pipeline for a prediction market.
+    Stage 1: Check Polymarket/Manifold for cross-market pricing
+    Stage 2: Multi-angle web research (news + base rates + expert forecasts)
+    Stage 3: Time-decay adjusted probability estimate
+    Stage 4: Kelly Criterion position sizing
+    Only markets with LARGE or MEDIUM edge AND research confidence >= Medium pass.
+    """
+    try:
+        # Calculate time remaining
+        hours_left = None
+        time_context = ""
+        if expires_at:
+            try:
+                exp_dt     = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+                hours_left = (exp_dt - datetime.now(timezone.utc)).total_seconds() / 3600
+                days_left  = hours_left / 24
+                time_context = f"TIME REMAINING: {days_left:.1f} days ({hours_left:.0f} hours)"
+
+                # Time-decay threshold: longer time = lower required probability edge
+                # Short-dated markets need bigger edge to be worth the risk
+                if hours_left < 48:
+                    min_edge_pp = 35  # need 35pp+ edge for markets expiring within 48h
+                elif hours_left < 168:  # 1 week
+                    min_edge_pp = 25
+                else:
+                    min_edge_pp = 15
+            except Exception:
+                min_edge_pp = 20
+                time_context = ""
+        else:
+            min_edge_pp = 20
+
+        entry_price = current_yes_price if target_side == "YES" else 1.0 - current_yes_price
+        min_true_prob = entry_price * 100 + min_edge_pp
+
+        # Stage 1: Cross-market check (fast)
+        poly_result = get_polymarket_comparison(question)
+        cross_market_context = ""
+        if poly_result and "NOT_FOUND" not in poly_result:
+            cross_market_context = "\nCROSS-MARKET PRICING: " + poly_result
+
+        # Stage 2: Deep research
         prompt = (
-            f"You are a prediction market researcher. Research this question thoroughly:\n\n"
-            f"MARKET QUESTION: {question}\n"
-            f"CURRENT MARKET PRICE: YES = ${current_yes_price:.3f} (implies {current_yes_price*100:.0f}% probability)\n"
-            f"TARGET SIDE: {target_side} at ${current_yes_price if target_side == 'YES' else 1-current_yes_price:.3f}\n"
-            f"POTENTIAL RETURN IF CORRECT: {potential_return:.1f}x\n\n"
-            f"Use web search to find:\n"
-            f"1. Current status of this event\n"
-            f"2. Expert opinions or forecasts\n"
-            f"3. Recent news that affects the probability\n"
-            f"4. Historical base rates for similar events\n\n"
-            f"Then answer:\n"
-            f"TRUE_PROBABILITY: [your estimate 0-100]%\n"
-            f"MARKET_PRICE_IMPLIES: {current_yes_price*100:.0f}%\n"
-            f"MISPRICING_DIRECTION: [OVERPRICED_YES / OVERPRICED_NO / FAIR]\n"
-            f"EDGE_SIZE: [LARGE (>30pp) / MEDIUM (15-30pp) / SMALL (<15pp) / NONE]\n"
-            f"KEY_FINDING: [most important fact you found, 1 sentence]\n"
+            f"You are an expert prediction market analyst. Research this thoroughly.\n\n"
+            f"QUESTION: {question}\n"
+            f"MYRIAD PRICE: YES = ${current_yes_price:.3f} ({current_yes_price*100:.0f}% implied probability)\n"
+            f"TARGET: BUY {target_side} at ${entry_price:.3f} for {potential_return:.1f}x return\n"
+            f"{time_context}\n"
+            f"{cross_market_context}\n\n"
+            f"Research in this order:\n"
+            f"1. Search for the CURRENT STATUS of this event right now\n"
+            f"2. Search for expert forecasts or prediction aggregators (FiveThirtyEight, Metaculus, etc.)\n"
+            f"3. Search for the MOST RECENT NEWS (last 7 days) affecting this outcome\n"
+            f"4. Consider the BASE RATE: historically, how often do similar events happen?\n\n"
+            f"CRITICAL THRESHOLDS:\n"
+            f"- Market implies {current_yes_price*100:.0f}% probability for YES\n"
+            f"- To recommend BUY {target_side}, your true probability estimate must show "
+            f"at least {min_edge_pp}pp edge (need >{min_true_prob:.0f}% true probability)\n"
+            f"- If cross-market data shows similar price, there is probably no edge\n"
+            f"- If cross-market data shows very different price, explain why Myriad might be wrong\n\n"
+            f"Respond with EXACTLY these fields:\n"
+            f"TRUE_PROBABILITY: [0-100]%\n"
+            f"EDGE_PP: [percentage points of edge, positive or negative]\n"
+            f"EDGE_SIZE: [LARGE(>{min_edge_pp+10}pp) / MEDIUM({min_edge_pp}-{min_edge_pp+10}pp) / SMALL / NONE]\n"
+            f"KEY_FINDING: [single most important fact that determines the outcome]\n"
+            f"BASE_RATE: [historical frequency of similar events, or UNKNOWN]\n"
+            f"CROSS_MARKET: [same/different/not_found vs Polymarket/Manifold]\n"
             f"TRADE_RECOMMENDATION: [BUY {target_side} / SKIP]\n"
-            f"CONFIDENCE: [High / Medium / Low]\n\n"
-            f"Only recommend BUY if TRUE_PROBABILITY justifies the {potential_return:.1f}x return target.\n"
-            f"For {potential_return:.1f}x return buying {target_side}, true probability must be >{(current_yes_price if target_side=='YES' else 1-current_yes_price)*100 + 15:.0f}% to have a real edge."
+            f"CONFIDENCE: [High / Medium / Low]\n"
+            f"REASONING: [2 sentences maximum]"
         )
 
         resp = client.messages.create(
             model="claude-sonnet-4-20250514",
-            max_tokens=600,
+            max_tokens=800,
             tools=[{"type": "web_search_20250305", "name": "web_search"}],
             messages=[{"role": "user", "content": prompt}]
         )
 
-        # Extract text from response (may include tool use blocks)
         result_text = ""
         for block in resp.content:
             if hasattr(block, "text"):
                 result_text += block.text
 
         # Parse structured response
-        lines = result_text.strip().splitlines()
         parsed = {}
-        for line in lines:
-            for key in ["TRUE_PROBABILITY", "MISPRICING_DIRECTION", "EDGE_SIZE",
-                        "KEY_FINDING", "TRADE_RECOMMENDATION", "CONFIDENCE"]:
+        for line in result_text.strip().splitlines():
+            for key in ["TRUE_PROBABILITY", "EDGE_PP", "EDGE_SIZE", "KEY_FINDING",
+                        "BASE_RATE", "CROSS_MARKET", "TRADE_RECOMMENDATION",
+                        "CONFIDENCE", "REASONING"]:
                 if line.startswith(key + ":"):
                     parsed[key] = line.replace(key + ":", "").strip()
 
-        # Extract numeric probability
-        true_prob_str = parsed.get("TRUE_PROBABILITY", "0").replace("%","").strip()
         try:
-            true_prob = float(true_prob_str)
+            true_prob = float(parsed.get("TRUE_PROBABILITY","0").replace("%","").strip())
         except Exception:
             true_prob = 0.0
 
+        # Kelly sizing based on research result
+        kelly_stake = kelly_criterion(true_prob, entry_price) if true_prob > 0 else PAPER_STAKE
+
         return {
             "true_prob":      true_prob,
+            "edge_pp":        parsed.get("EDGE_PP", "0"),
             "edge_size":      parsed.get("EDGE_SIZE", "UNKNOWN"),
             "key_finding":    parsed.get("KEY_FINDING", ""),
+            "base_rate":      parsed.get("BASE_RATE", "UNKNOWN"),
+            "cross_market":   parsed.get("CROSS_MARKET", "not_found"),
             "recommendation": parsed.get("TRADE_RECOMMENDATION", "SKIP"),
             "confidence":     parsed.get("CONFIDENCE", "Low"),
-            "raw":            result_text[:300],
+            "reasoning":      parsed.get("REASONING", ""),
+            "kelly_stake":    kelly_stake,
+            "hours_left":     hours_left,
+            "raw":            result_text[:400],
         }
 
     except Exception as e:
         logger.error(f"Research error for '{question[:40]}': {e}")
         return {
-            "true_prob": 0.0, "edge_size": "UNKNOWN",
-            "key_finding": "", "recommendation": "SKIP", "confidence": "Low", "raw": ""
+            "true_prob": 0.0, "edge_pp": "0", "edge_size": "UNKNOWN",
+            "key_finding": "", "base_rate": "UNKNOWN", "cross_market": "not_found",
+            "recommendation": "SKIP", "confidence": "Low", "reasoning": "",
+            "kelly_stake": PAPER_STAKE, "hours_left": None, "raw": ""
         }
 
 
@@ -1495,28 +1669,33 @@ def filter_and_research_markets(thin_markets: list, liquid_markets: list):
         y_price = float((next((o for o in m.get("outcomes",[]) if o.get("title","").upper() in ("YES","TRUE")), {}) or {}).get("price", 0.5))
         side    = m.get("_target_side", "YES")
         ret     = m.get("_potential_return", 2.3)
+        expires = m.get("expiresAt", "")
 
         logger.info(f"  Researching: {q[:50]}...")
-        research = research_market(q, y_price, side, ret)
+        research = research_market(q, y_price, side, ret, expires)
         m["_research"] = research
-        time.sleep(2)  # brief pause between web search calls
+        time.sleep(3)
 
         if research["recommendation"] == f"BUY {side}" and research["edge_size"] in ("LARGE","MEDIUM"):
             researched_thin.append(m)
-            logger.info(f"  ✓ CONFIRMED edge: {q[:40]} | True prob: {research['true_prob']}% | {research['edge_size']}")
+            logger.info(f"  ✓ CONFIRMED: {q[:40]} | "
+                        f"True: {research['true_prob']}% | Edge: {research['edge_size']} | "
+                        f"Kelly stake: ${research['kelly_stake']}")
         else:
-            logger.info(f"  ✗ No edge: {q[:40]} | {research['recommendation']} | {research['edge_size']}")
+            logger.info(f"  ✗ No edge: {q[:40]} | {research['recommendation']} | "
+                        f"Edge: {research['edge_size']} | Cross-mkt: {research['cross_market']}")
 
     for m in liquid_candidates[:3]:
         q       = m.get("title", "")
         y_price = float((next((o for o in m.get("outcomes",[]) if o.get("title","").upper() in ("YES","TRUE")), {}) or {}).get("price", 0.5))
         side    = m.get("_target_side", "YES")
         ret     = m.get("_potential_return", 2.3)
+        expires = m.get("expiresAt", "")
 
         logger.info(f"  Researching liquid: {q[:50]}...")
-        research = research_market(q, y_price, side, ret)
+        research = research_market(q, y_price, side, ret, expires)
         m["_research"] = research
-        time.sleep(2)
+        time.sleep(3)
 
         if research["recommendation"] == f"BUY {side}" and research["edge_size"] == "LARGE":
             researched_liquid.append(m)
@@ -1566,18 +1745,33 @@ def analyze_myriad(thin_researched, liquid_researched):
         yes_p = outcomes.get("YES", outcomes.get("True", "?"))
         no_p  = outcomes.get("NO",  outcomes.get("False", "?"))
 
+        # Pull all research fields
+        kelly_stake  = r.get("kelly_stake", PAPER_STAKE)
+        base_rate    = r.get("base_rate", "UNKNOWN")
+        cross_market = r.get("cross_market", "not_found")
+        reasoning    = r.get("reasoning", "")
+        hours_left   = r.get("hours_left")
+        time_str     = f"{hours_left/24:.1f} days ({hours_left:.0f}h)" if hours_left else "unknown"
+        edge_pp      = r.get("edge_pp", "?")
+
         block = "\n".join([
             f"ALERT: {m.get('title','?')}",
             f"MARKET URL: {url}",
             f"MARKET TIER: {tier}",
             f"VOLUME: ${float(vol or 0):.0f}",
+            f"TIME REMAINING: {time_str}",
             f"CURRENT ODDS: YES = ${yes_p} / NO = ${no_p}",
             f"SUGGESTED PLAY: BUY {side} at ${price:.3f}",
-            f"POTENTIAL RETURN: {ret:.1f}x (${PAPER_STAKE:.0f} stake = ${PAPER_STAKE*ret:.0f} if correct)",
+            f"POTENTIAL RETURN: {ret:.1f}x",
             f"MARKET IMPLIES: {price*100:.0f}% probability",
             f"RESEARCH ESTIMATE: {true_p:.0f}% true probability",
+            f"EDGE: {edge_pp} percentage points",
+            f"BASE RATE: {base_rate}",
+            f"CROSS-MARKET: {cross_market}",
             f"KEY FINDING: {finding}",
+            f"REASONING: {reasoning}",
             f"EXPECTED VALUE: {ev_str}",
+            f"KELLY STAKE: ${kelly_stake:.0f} suggested (paper trade = ${PAPER_STAKE:.0f})",
             f"EDGE TYPE: RESEARCH-CONFIRMED MISPRICING",
             f"CONFIDENCE: {conf}",
         ])
@@ -1876,56 +2070,103 @@ def send_myriad_email(analysis):
         block = block.strip()
         if not block or "ALERT:" not in block:
             continue
-        inner, market_url, tier = "", "", ""
+
+        # Parse all fields from block
+        fields = {}
         for line in block.splitlines():
-            if line.startswith("ALERT:"):
-                inner += f'<h3 style="margin:0 0 10px;color:#1a1a2e">{line.replace("ALERT:","").strip()}</h3>'
-            elif line.startswith("MARKET URL:"):
-                market_url = line.replace("MARKET URL:", "").strip()
-            elif line.startswith("MARKET TIER:"):
-                tier = line.replace("MARKET TIER:", "").strip()
-                tier_col = "#e63946" if tier == "THIN" else "#f4a261"
-                inner += (f'<span style="display:inline-block;background:{tier_col};color:#fff;'
-                          f'font-size:11px;font-weight:bold;padding:2px 8px;border-radius:10px;'
-                          f'margin-bottom:8px">{tier} MARKET</span>')
-            elif line.startswith("VOLUME:"):
-                inner += f'<p style="margin:5px 0;font-size:13px;color:#666"><strong>Volume:</strong> {line.replace("VOLUME:","").strip()}</p>'
-            elif line.startswith("CURRENT ODDS:"):
-                inner += f'<p style="margin:5px 0"><strong>Odds:</strong> {line.replace("CURRENT ODDS:","").strip()}</p>'
-            elif line.startswith("EDGE TYPE:"):
-                edge = line.replace("EDGE TYPE:", "").strip()
-                inner += f'<p style="margin:5px 0"><strong>Edge:</strong> {edge}</p>'
-            elif line.startswith("WHY IT LOOKS WRONG:"):
-                inner += f'<p style="margin:5px 0"><strong>Why:</strong> {line.replace("WHY IT LOOKS WRONG:","").strip()}</p>'
-            elif line.startswith("SUGGESTED PLAY:"):
-                val = line.replace("SUGGESTED PLAY:", "").strip()
-                inner += f'<p style="margin:8px 0;font-size:16px;font-weight:bold;color:#2d6a4f">▶ {val}</p>'
-            elif line.startswith("EXPECTED VALUE:"):
-                inner += f'<p style="margin:5px 0;font-style:italic;color:#555">{line.replace("EXPECTED VALUE:","").strip()}</p>'
-            elif line.startswith("CONFIDENCE:"):
-                level = line.replace("CONFIDENCE:", "").strip()
-                col   = {"High":"#e63946","Medium":"#f4a261","Low":"#adb5bd"}.get(level,"#adb5bd")
-                inner += f'<p style="margin:5px 0"><strong>Confidence:</strong> <span style="color:{col};font-weight:bold">{level}</span></p>'
-        if inner:
-            border = "#e63946" if tier == "THIN" else "#7b2ff7"
-            trade_btn = (f'<a href="{market_url}" style="display:inline-block;background:#7b2ff7;'
-                         f'color:#fff;padding:10px 20px;text-decoration:none;border-radius:6px;'
-                         f'font-size:14px;font-weight:bold;margin-top:12px;margin-right:8px">'
-                         f'▶ Trade This Market</a>') if market_url else ""
-            log_btn = (f'<a href="{log_url}/log" style="display:inline-block;background:#2d6a4f;'
-                       f'color:#fff;padding:10px 20px;text-decoration:none;border-radius:6px;'
-                       f'font-size:14px;font-weight:bold;margin-top:12px">📋 Log Trade</a>') if log_url else ""
-            cards += (f'<div style="background:#f8f9ff;border-left:4px solid {border};'
-                      f'padding:16px;border-radius:6px;margin-bottom:16px">{inner}{trade_btn}{log_btn}</div>')
-    html = ('<html><body style="font-family:Arial,sans-serif;max-width:620px;margin:0 auto;padding:24px">'
-            '<h2 style="color:#1a1a2e">🔮 Myriad Markets — Opportunity Spotted</h2>'
-            '<p style="color:#666;font-size:13px;margin-bottom:16px">Targeting thin and mispriced markets for maximum edge</p>'
-            + cards +
-            '<p style="color:#aaa;font-size:11px;margin-top:24px">Not financial advice. '
-            'Thin markets have less liquidity — size positions accordingly.</p>'
-            '</body></html>')
-    send_email("🔮 Myriad Alert — Opportunity Spotted", html,
+            for prefix in ["ALERT","MARKET URL","MARKET TIER","VOLUME","TIME REMAINING",
+                           "CURRENT ODDS","SUGGESTED PLAY","POTENTIAL RETURN",
+                           "MARKET IMPLIES","RESEARCH ESTIMATE","EDGE","BASE RATE",
+                           "CROSS-MARKET","KEY FINDING","REASONING","EXPECTED VALUE",
+                           "KELLY STAKE","EDGE TYPE","CONFIDENCE"]:
+                if line.startswith(prefix + ":"):
+                    fields[prefix] = line.replace(prefix + ":", "").strip()
+
+        if not fields.get("ALERT"):
+            continue
+
+        tier      = fields.get("MARKET TIER", "")
+        tier_col  = "#e63946" if tier == "THIN" else "#f4a261"
+        border    = "#e63946" if tier == "THIN" else "#7b2ff7"
+        conf      = fields.get("CONFIDENCE", "Medium")
+        conf_col  = {"High":"#e63946","Medium":"#f4a261","Low":"#adb5bd"}.get(conf,"#adb5bd")
+        market_url= fields.get("MARKET URL","")
+
+        # Research vs market pricing comparison bar
+        try:
+            mkt_pct    = float(fields.get("MARKET IMPLIES","0").replace("%","").replace(" probability",""))
+            res_pct    = float(fields.get("RESEARCH ESTIMATE","0").replace("%","").replace(" true probability",""))
+            gap        = res_pct - mkt_pct
+            gap_col    = "#2d6a4f" if gap > 0 else "#e63946"
+            prob_bar   = (
+                f'<div style="margin:10px 0;background:#f0f2ff;border-radius:6px;padding:10px">'
+                f'<div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:4px">'
+                f'<span>Market says: <strong>{mkt_pct:.0f}%</strong></span>'
+                f'<span style="color:{gap_col};font-weight:bold">Gap: {gap:+.0f}pp</span>'
+                f'<span>Research says: <strong style="color:{gap_col}">{res_pct:.0f}%</strong></span>'
+                f'</div></div>'
+            )
+        except Exception:
+            prob_bar = ""
+
+        inner = (
+            f'<h3 style="margin:0 0 8px;color:#1a1a2e;font-size:15px">{fields.get("ALERT","")}</h3>'
+            f'<div style="margin-bottom:8px">'
+            f'<span style="background:{tier_col};color:#fff;font-size:11px;font-weight:bold;'
+            f'padding:2px 8px;border-radius:10px;margin-right:6px">{tier} MARKET</span>'
+            f'<span style="background:#f0f2ff;color:#4361ee;font-size:11px;font-weight:bold;'
+            f'padding:2px 8px;border-radius:10px">Vol: {fields.get("VOLUME","?")}</span>'
+            f'<span style="background:#fff3e0;color:#e65100;font-size:11px;font-weight:bold;'
+            f'padding:2px 8px;border-radius:10px;margin-left:6px">⏱ {fields.get("TIME REMAINING","?")}</span>'
+            f'</div>'
+            + prob_bar
+            + f'<p style="margin:6px 0"><strong>Odds:</strong> {fields.get("CURRENT ODDS","?")}</p>'
+            f'<p style="margin:8px 0;font-size:17px;font-weight:bold;color:#2d6a4f">▶ {fields.get("SUGGESTED PLAY","?")}</p>'
+            f'<p style="margin:4px 0;font-size:13px"><strong>Return:</strong> {fields.get("POTENTIAL RETURN","?")} &nbsp;|&nbsp; '
+            f'<strong>EV:</strong> {fields.get("EXPECTED VALUE","?")}</p>'
+            f'<div style="background:#fffde7;border-radius:6px;padding:10px;margin:8px 0">'
+            f'<p style="margin:3px 0;font-size:13px"><strong>🔍 Key Finding:</strong> {fields.get("KEY FINDING","")}</p>'
+            f'<p style="margin:3px 0;font-size:13px"><strong>📊 Base Rate:</strong> {fields.get("BASE RATE","UNKNOWN")}</p>'
+            f'<p style="margin:3px 0;font-size:13px"><strong>🔄 Cross-Market:</strong> {fields.get("CROSS-MARKET","not checked")}</p>'
+            f'<p style="margin:3px 0;font-size:12px;color:#555;font-style:italic">{fields.get("REASONING","")}</p>'
+            f'</div>'
+            f'<p style="margin:4px 0;font-size:13px"><strong>💰 Kelly Stake:</strong> {fields.get("KELLY STAKE","?")}</p>'
+            f'<p style="margin:4px 0;font-size:13px"><strong>Confidence:</strong> '
+            f'<span style="color:{conf_col};font-weight:bold">{conf}</span></p>'
+        )
+
+        trade_btn = (
+            f'<a href="{market_url}" style="display:inline-block;background:#7b2ff7;color:#fff;'
+            f'padding:10px 20px;text-decoration:none;border-radius:6px;font-size:14px;'
+            f'font-weight:bold;margin-top:12px;margin-right:8px">▶ Trade This Market</a>'
+        ) if market_url else ""
+
+        log_btn = (
+            f'<a href="{log_url}/log" style="display:inline-block;background:#2d6a4f;color:#fff;'
+            f'padding:10px 20px;text-decoration:none;border-radius:6px;font-size:14px;'
+            f'font-weight:bold;margin-top:12px">📋 Log Trade</a>'
+        ) if log_url else ""
+
+        cards += (
+            f'<div style="background:#f8f9ff;border-left:4px solid {border};'
+            f'padding:16px;border-radius:6px;margin-bottom:16px">'
+            f'{inner}{trade_btn}{log_btn}</div>'
+        )
+
+    html = (
+        '<html><body style="font-family:Arial,sans-serif;max-width:640px;margin:0 auto;padding:24px">'
+        '<h2 style="color:#1a1a2e">🔮 Myriad — Research-Confirmed Opportunity</h2>'
+        '<p style="color:#666;font-size:13px;margin-bottom:16px">'
+        'Every alert below has been web-searched and verified. '
+        'Market price vs research estimate shown for each.</p>'
+        + cards +
+        '<p style="color:#aaa;font-size:11px;margin-top:24px">'
+        'Kelly stake is a suggestion only. Thin markets = lower liquidity. '
+        'Not financial advice.</p></body></html>'
+    )
+    send_email("🔮 Myriad Alert — Research Confirmed", html,
                f"Myriad Opportunity\n\n{analysis}\n\nNot financial advice.")
+
 
 
 def send_crypto_email(analysis, fg: dict = None):
@@ -1950,6 +2191,7 @@ def send_crypto_email(analysis, fg: dict = None):
             "RSI:":                 lambda v: f'<p style="margin:5px 0"><strong>RSI:</strong> {v}</p>',
             "FUNDING RATE:":        lambda v: f'<p style="margin:5px 0"><strong>Funding Rate:</strong> {v}</p>',
             "24H CHANGE:":          lambda v: f'<p style="margin:5px 0"><strong>24h:</strong> {v}</p>',
+            "PATTERN:":             lambda v: f'<p style="margin:5px 0"><strong>Pattern:</strong> {v}</p>',
             "WEEKLY TREND:":        lambda v: f'<p style="margin:5px 0"><strong>Weekly:</strong> {v}</p>',
             "FEAR & GREED CONTEXT:":lambda v: f'<p style="margin:5px 0;font-style:italic;color:#666">{v}</p>',
             "REASONING:":           lambda v: f'<p style="margin:5px 0"><strong>Why:</strong> {v}</p>',
