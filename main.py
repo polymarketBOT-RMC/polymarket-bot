@@ -1616,12 +1616,16 @@ def research_market(question: str, current_yes_price: float,
             f"MYRIAD: YES=${current_yes_price:.2f} ({current_yes_price*100:.0f}% implied)\n"
             f"TARGET: BUY {target_side} @ ${entry_price:.2f} = {potential_return:.1f}x return\n"
             f"{time_context}\n\n"
-            f"Do BOTH of these searches (both required, use web_search tool):\n"
+            f"Do ALL THREE of these searches (all required, use web_search tool):\n"
             f"1. Current status/news for: {question}\n"
             f"2. Search 'site:polymarket.com {question[:60]}' — find the equivalent Polymarket market "
-            f"and report its current {target_side} price as a decimal (e.g. 0.65).\n\n"
+            f"and report its current {target_side} price as a decimal (e.g. 0.65).\n"
+            f"3. Check the resolution criteria for this market — is it completely clear what must "
+            f"happen, who decides the outcome, and by exactly when? Flag any ambiguity.\n\n"
             f"Myriad implies {entry_price*100:.0f}% for {target_side}. "
-            f"If Polymarket prices {target_side} >10pp higher, that is strong evidence of mispricing.\n\n"
+            f"If Polymarket prices {target_side} >10pp higher, that is strong evidence of mispricing.\n"
+            f"NOTE: If resolution criteria are ambiguous, the low Myriad price may reflect that "
+            f"uncertainty rather than genuine mispricing — flag this.\n\n"
             f"Need >{min_true_prob:.0f}% true probability to recommend BUY.\n\n"
             f"Reply with ONLY these lines:\n"
             f"TRUE_PROBABILITY: [0-100]%\n"
@@ -1630,6 +1634,7 @@ def research_market(question: str, current_yes_price: float,
             f"KEY_FINDING: [1 sentence]\n"
             f"BASE_RATE: [brief or UNKNOWN]\n"
             f"CROSS_MARKET: [Polymarket {target_side} price as decimal e.g. 0.65, or not_found]\n"
+            f"RESOLUTION_CLARITY: [CLEAR / AMBIGUOUS / UNKNOWN]\n"
             f"TRADE_RECOMMENDATION: [BUY {target_side} / SKIP]\n"
             f"CONFIDENCE: [High/Medium/Low]\n"
             f"REASONING: [max 1 sentence]"
@@ -1668,13 +1673,14 @@ def research_market(question: str, current_yes_price: float,
             "edge_size":      parsed.get("EDGE_SIZE", "UNKNOWN"),
             "key_finding":    parsed.get("KEY_FINDING", ""),
             "base_rate":      parsed.get("BASE_RATE", "UNKNOWN"),
-            "cross_market":   parsed.get("CROSS_MARKET", "not_found"),
-            "recommendation": parsed.get("TRADE_RECOMMENDATION", "SKIP"),
-            "confidence":     parsed.get("CONFIDENCE", "Low"),
-            "reasoning":      parsed.get("REASONING", ""),
-            "kelly_stake":    kelly_stake,
-            "hours_left":     hours_left,
-            "raw":            result_text[:300],
+            "cross_market":        parsed.get("CROSS_MARKET", "not_found"),
+            "resolution_clarity": parsed.get("RESOLUTION_CLARITY", "UNKNOWN"),
+            "recommendation":     parsed.get("TRADE_RECOMMENDATION", "SKIP"),
+            "confidence":         parsed.get("CONFIDENCE", "Low"),
+            "reasoning":          parsed.get("REASONING", ""),
+            "kelly_stake":        kelly_stake,
+            "hours_left":         hours_left,
+            "raw":                result_text[:300],
         }
 
     except Exception as e:
@@ -1682,7 +1688,8 @@ def research_market(question: str, current_yes_price: float,
         return {
             "true_prob": 0.0, "edge_pp": "0", "edge_size": "UNKNOWN",
             "key_finding": "", "base_rate": "UNKNOWN", "cross_market": "not_found",
-            "recommendation": "SKIP", "confidence": "Low", "reasoning": "",
+            "resolution_clarity": "UNKNOWN", "recommendation": "SKIP",
+            "confidence": "Low", "reasoning": "",
             "kelly_stake": PAPER_STAKE, "hours_left": None, "raw": ""
         }
 
@@ -1698,6 +1705,12 @@ def _research_confirms_edge(research: dict, side: str, entry_price: float) -> bo
       - Require LARGE edge only (stricter without cross-market confirmation)
     """
     if research["recommendation"] != f"BUY {side}":
+        return False
+
+    # Ambiguous resolution criteria means the discount is warranted, not a mispricing
+    clarity = research.get("resolution_clarity", "UNKNOWN").upper()
+    if clarity == "AMBIGUOUS":
+        logger.info(f"  ✗ Skipping — resolution criteria flagged as AMBIGUOUS")
         return False
 
     cross = research.get("cross_market", "not_found").strip().lower()
@@ -1723,19 +1736,74 @@ def _research_confirms_edge(research: dict, side: str, entry_price: float) -> bo
         return research["edge_size"] == "LARGE"
 
 
+def _score_candidate(m: dict) -> float:
+    """
+    Score a candidate market to decide which ones are worth spending research calls on.
+    Higher score = research this first.
+    Factors: potential return, time-to-expiry sweet spot, volume (proxy for liquidity).
+    """
+    try:
+        ret = float(m.get("_potential_return", 2.3))
+        vol = float(m.get("volume", 0) or 0)
+        expires = m.get("expiresAt", "")
+
+        # Return score — higher potential return is better, diminishing returns above 5x
+        ret_score = min(ret / 2.3, 5.0 / 2.3)
+
+        # Time score — sweet spot is 3–30 days
+        # Too short: not enough time to act / resolve
+        # Too long: research will be stale, market unlikely to correct soon
+        time_score = 1.0
+        if expires:
+            try:
+                exp_dt    = datetime.fromisoformat(expires.replace("Z", "+00:00"))
+                days_left = (exp_dt - datetime.now(timezone.utc)).total_seconds() / 86400
+                if 3 <= days_left <= 30:
+                    time_score = 2.0   # ideal window
+                elif 30 < days_left <= 60:
+                    time_score = 1.3
+                elif days_left < 3:
+                    time_score = 0.2   # too close — no time to act
+                else:
+                    time_score = 0.7   # too far out — research will go stale
+            except Exception:
+                pass
+
+        # Volume score — reward some liquidity, penalise dust markets
+        if vol < 100:
+            vol_score = 0.4   # almost nothing traded, can't fill
+        elif vol < 500:
+            vol_score = 0.8
+        elif vol <= 5000:
+            vol_score = 1.3   # thin but tradeable
+        else:
+            vol_score = 1.0   # medium tier
+
+        return ret_score * time_score * vol_score
+    except Exception:
+        return 1.0
+
+
 def filter_and_research_markets(thin_markets: list, liquid_markets: list):
     """
     Full pipeline:
     1. Pre-filter for 2.3x+ value potential
-    2. Research each candidate with web search
-    3. Return only markets where research confirms genuine edge
+    2. Rank candidates by return × time × liquidity score
+    3. Research the top candidates with web search
+    4. Return only markets where research confirms genuine edge
     """
     # Step 1: Value filter
     thin_candidates   = prefilter_for_value(thin_markets)
     liquid_candidates = prefilter_for_value(liquid_markets)
 
-    # Step 2: Research the top candidates (limit to avoid API costs)
-    # Prioritise thin markets — research up to 5 thin + 3 liquid
+    # Step 2: Rank by score so we spend research calls on the best candidates first
+    thin_candidates.sort(key=_score_candidate, reverse=True)
+    liquid_candidates.sort(key=_score_candidate, reverse=True)
+    if thin_candidates:
+        logger.info(f"  Top thin candidate: {thin_candidates[0].get('title','')[:50]} "
+                    f"(score {_score_candidate(thin_candidates[0]):.2f})")
+
+    # Step 3: Research the top candidates (limit to avoid API costs)
     researched_thin   = []
     researched_liquid = []
 
@@ -1753,7 +1821,17 @@ def filter_and_research_markets(thin_markets: list, liquid_markets: list):
         m["_research"] = research
         time.sleep(20)  # 20s gap = ~3 calls/min = well within 30k token/min limit
 
+        # Price staleness check — re-fetch live price; abort if it moved >5pp during research
         entry_p = m.get("_entry_price", 0.5)
+        fresh_yes, _ = get_myriad_price(str(m.get("id", "")))
+        if fresh_yes is not None:
+            fresh_entry = fresh_yes if side == "YES" else 1.0 - fresh_yes
+            moved_pp = abs(fresh_entry - entry_p) * 100
+            if moved_pp > 5.0:
+                logger.info(f"  ✗ Stale — price moved {moved_pp:.1f}pp during research, skipping")
+                continue
+            entry_p = fresh_entry   # use the live price for edge calculation
+
         if _research_confirms_edge(research, side, entry_p):
             researched_thin.append(m)
             logger.info(f"  ✓ CONFIRMED: {q[:40]} | "
@@ -1776,6 +1854,15 @@ def filter_and_research_markets(thin_markets: list, liquid_markets: list):
         time.sleep(20)
 
         entry_p = m.get("_entry_price", 0.5)
+        fresh_yes, _ = get_myriad_price(str(m.get("id", "")))
+        if fresh_yes is not None:
+            fresh_entry = fresh_yes if side == "YES" else 1.0 - fresh_yes
+            moved_pp = abs(fresh_entry - entry_p) * 100
+            if moved_pp > 5.0:
+                logger.info(f"  ✗ Stale — price moved {moved_pp:.1f}pp during research, skipping")
+                continue
+            entry_p = fresh_entry
+
         if _research_confirms_edge(research, side, entry_p):
             researched_liquid.append(m)
 
