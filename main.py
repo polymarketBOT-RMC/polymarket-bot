@@ -574,6 +574,61 @@ def get_btc_1h_change() -> float:
         logger.error(f"BTC 1h change error: {e}")
     return 0.0
 
+def get_funding_rates() -> dict:
+    """
+    Fetch perpetual futures funding rates — a leading indicator for crypto squeezes.
+    Very negative rates = shorts paying longs = short squeeze imminent (BUY signal).
+    Very positive rates = longs paying shorts = long flush risk (SELL signal).
+    Uses Binance futures public endpoint — no API key, no geo restriction on futures data.
+    """
+    rates = {}
+    try:
+        r = requests.get(
+            "https://fapi.binance.com/fapi/v1/premiumIndex",
+            timeout=15
+        )
+        if r.status_code == 200:
+            watch = {"BTCUSDT","ETHUSDT","SOLUSDT","BNBUSDT","XRPUSDT",
+                     "ADAUSDT","AVAXUSDT","DOTUSDT","LINKUSDT","MATICUSDT"}
+            for item in r.json():
+                sym = item.get("symbol", "")
+                if sym in watch:
+                    rate = float(item.get("lastFundingRate", 0)) * 100
+                    rates[sym.replace("USDT", "")] = round(rate, 4)
+            logger.info(f"Funding rates: {rates}")
+        else:
+            logger.warning(f"Binance futures API returned {r.status_code}")
+    except Exception as e:
+        logger.error(f"Funding rate error: {e}")
+    return rates
+
+def interpret_funding_rates(rates: dict) -> str:
+    """Convert raw funding rates into a plain-English signal for Claude."""
+    if not rates:
+        return "Funding rate data unavailable this cycle."
+
+    squeeze = [f"{s} ({r:+.3f}%)" for s, r in rates.items() if r < -0.05]
+    dump    = [f"{s} ({r:+.3f}%)" for s, r in rates.items() if r > 0.10]
+    parts   = []
+
+    if squeeze:
+        parts.append(
+            f"SHORT SQUEEZE ALERT — funding deeply negative on: {', '.join(squeeze)}. "
+            f"Shorts are paying heavy fees to stay short. A squeeze is statistically likely."
+        )
+    if dump:
+        parts.append(
+            f"LONG FLUSH RISK — funding very positive on: {', '.join(dump)}. "
+            f"Overleveraged longs risk cascade liquidations."
+        )
+    if not parts:
+        sample = [f"{s}: {r:+.3f}%" for s, r in list(rates.items())[:5]]
+        return f"Funding rates neutral. Sample: {', '.join(sample)}"
+
+    return " | ".join(parts)
+
+
+
 def get_all_crypto_coins():
     try:
         r = requests.get(f"{COINGECKO_BASE}/coins/markets",
@@ -729,7 +784,8 @@ def compute_conviction_score(coin_data: dict, btc_1h_change: float,
 
     return max(0, score)
 
-def analyze_crypto(crypto_data_list, fg: dict, btc_1h_change: float):
+def analyze_crypto(crypto_data_list, fg: dict, btc_1h_change: float,
+                   funding_summary: str = ""):
     oversold   = [d["symbol"] for d in crypto_data_list if d.get("rsi_14") and d["rsi_14"] < 32]
     overbought = [d["symbol"] for d in crypto_data_list if d.get("rsi_14") and d["rsi_14"] > 68]
 
@@ -737,14 +793,15 @@ def analyze_crypto(crypto_data_list, fg: dict, btc_1h_change: float):
     if fg["value"] < 25:
         fg_warning = f"\n⚠️ EXTREME FEAR ({fg['value']}/100) — be very cautious with BUY signals."
     elif fg["value"] > 80:
-        fg_warning = f"\n⚠️ EXTREME GREED ({fg['value']}/100) — be very cautious, market may be overextended."
+        fg_warning = f"\n⚠️ EXTREME GREED ({fg['value']}/100) — market may be overextended."
 
     btc_warning = ""
     if btc_1h_change < -4:
         btc_warning = f"\n⚠️ BTC dropped {btc_1h_change:.1f}% in the last hour — suppress altcoin BUY signals."
 
-    hint = f"\nFear & Greed Index: {fg['value']}/100 ({fg['label']})"
+    hint  = f"\nFear & Greed Index: {fg['value']}/100 ({fg['label']})"
     hint += f"\nBTC 1h change: {btc_1h_change:+.2f}%"
+    hint += f"\nFunding Rates: {funding_summary}" if funding_summary else ""
     hint += fg_warning + btc_warning
     if oversold:
         hint += f"\nOVERSOLD coins (RSI<32): {', '.join(oversold)}"
@@ -754,28 +811,32 @@ def analyze_crypto(crypto_data_list, fg: dict, btc_1h_change: float):
     prompt = (
         "You are a professional crypto trader analysing the market.\n\n"
         "Market context:\n" + hint + "\n\n"
-        "Coin data (top movers, gainers, losers from top 200 by market cap):\n\n"
+        "Coin data:\n\n"
         + json.dumps(crypto_data_list, indent=2)
         + "\n\nSIGNAL CRITERIA (alert if ANY met):\n"
-        "• RSI below 32 = oversold, potential BUY\n"
-        "• RSI above 68 = overbought, potential SELL/AVOID\n"
+        "• RSI below 32 = oversold → BUY\n"
+        "• RSI above 68 = overbought → SELL/AVOID\n"
+        "• Funding rate very negative (<-0.05%) = short squeeze imminent → strong BUY\n"
+        "• Funding rate very positive (>+0.10%) = long flush risk → SELL\n"
         "• 24h gain >+7% with volume >$50M = momentum BUY\n"
-        "• 24h loss >-8% with RSI<40 = oversold bounce candidate\n"
-        "• Weekly trend UP with price above SMA50 = trend continuation BUY\n\n"
+        "• 24h loss >-8% with RSI<40 = oversold bounce\n"
+        "• Weekly trend UP + price above SMA50 = trend continuation BUY\n\n"
         "HARD RULES:\n"
-        "• If BTC dropped more than 4% in the last hour, do NOT suggest BUY on any altcoin\n"
-        "• If Fear & Greed is below 25, only flag the very strongest oversold setups\n"
-        "• If Fear & Greed is above 80, flag overbought coins aggressively\n"
-        "• Max 3 alerts. Never Low confidence. Weekly_trend 'down' reduces BUY conviction.\n\n"
+        "• Funding rate signals override RSI — they are leading indicators\n"
+        "• If BTC dropped >4% in last hour, suppress all altcoin BUY signals\n"
+        "• If Fear & Greed <25, only flag strongest setups\n"
+        "• If Fear & Greed >80, flag overbought aggressively\n"
+        "• Max 3 alerts. Never Low confidence.\n\n"
         "For each alert use EXACTLY this format:\n\n"
         "ALERT: [SYMBOL]\n"
         "PRICE: $[price]\n"
         "SIGNAL: [BUY / SELL / AVOID]\n"
         "RSI: [value] — [OVERSOLD/NEUTRAL/OVERBOUGHT]\n"
+        "FUNDING RATE: [value or N/A] — [interpretation]\n"
         "24H CHANGE: [value]%\n"
-        "WEEKLY TREND: [up/down/unknown]\n"
+        "WEEKLY TREND: [up/down/flat]\n"
         "FEAR & GREED CONTEXT: [one sentence]\n"
-        "REASONING: [2 sentences]\n"
+        "REASONING: [2 sentences combining ALL signals]\n"
         "SUGGESTED ENTRY: $[price]\n"
         "CONFIDENCE: [Medium / High]\n"
         "---\n\n"
@@ -836,9 +897,12 @@ def run_crypto_cycle():
     check_crypto_positions()
     prune_dedup_cache()
 
-    # UPGRADE 2 & 6: Get market context before analysis
+    # Get all market context in parallel before analysis
     fg            = get_fear_and_greed()
     btc_1h_change = get_btc_1h_change()
+    funding_rates = get_funding_rates()
+    funding_summary = interpret_funding_rates(funding_rates)
+    logger.info(f"Funding: {funding_summary[:80]}...")
 
     coins = get_all_crypto_coins()
     if not coins:
@@ -847,30 +911,40 @@ def run_crypto_cycle():
 
     top_coins = prefilter_coins(coins, top_n=CRYPTO_TOP_N)
 
-    # UPGRADE 3: Concurrent OHLC fetching
-    logger.info(f"Fetching OHLC concurrently for {len(top_coins)} coins...")
+    logger.info(f"Fetching OHLC for {len(top_coins)} coins...")
     summaries = build_crypto_summaries_concurrent(top_coins)
 
-    # UPGRADE 5: Pre-score coins and filter low-conviction ones before sending to Claude
+    # Boost conviction score for coins flagged by funding rates
+    squeeze_coins = {s for s, r in funding_rates.items() if r < -0.05}
+    dump_coins    = {s for s, r in funding_rates.items() if r > 0.10}
+
     high_conviction = []
     for s in summaries:
-        # Estimate likely direction from RSI
-        rsi = s.get("rsi_14")
-        if rsi:
-            direction = "BUY" if rsi < 50 else "SELL"
-        else:
-            direction = "BUY"
-        score = compute_conviction_score(s, btc_1h_change, fg["value"], direction)
+        rsi       = s.get("rsi_14")
+        direction = "BUY" if (rsi and rsi < 50) else "SELL"
+        score     = compute_conviction_score(s, btc_1h_change, fg["value"], direction)
+
+        # Funding rate bonus — this is a genuine leading indicator
+        coin_sym = s.get("symbol", "").replace("/USDT", "")
+        if coin_sym in squeeze_coins:
+            score += 3  # short squeeze imminent = strong BUY boost
+            logger.info(f"Funding rate BUY boost: {coin_sym} (score +3)")
+        if coin_sym in dump_coins:
+            score += 2  # long flush risk = SELL boost
+            logger.info(f"Funding rate SELL boost: {coin_sym} (score +2)")
+
         s["conviction_score"] = score
+        s["funding_rate"]     = funding_rates.get(coin_sym)
         if score >= 2:
             high_conviction.append(s)
 
     if not high_conviction:
-        logger.info(f"No high-conviction crypto setups this cycle (F&G: {fg['value']}, BTC 1h: {btc_1h_change:+.1f}%)")
+        logger.info(f"No high-conviction setups (F&G: {fg['value']}, BTC 1h: {btc_1h_change:+.1f}%)")
         return
 
     logger.info(f"{len(high_conviction)} high-conviction coins. Sending to Claude...")
-    analysis = analyze_crypto(high_conviction, fg, btc_1h_change)
+    analysis = analyze_crypto(high_conviction, fg, btc_1h_change, funding_summary)
+
 
     if not analysis or analysis == "NO_ALERT":
         logger.info("Claude: no crypto signals this cycle.")
@@ -908,37 +982,77 @@ def run_crypto_cycle():
 # MYRIAD MARKETS BOT (every 30 minutes)
 # ══════════════════════════════════════════════════════════════════════════════
 def get_myriad_markets():
+    """
+    UPGRADE — Two-pass market fetch:
+    Pass 1: Low-volume markets ($0-$5k) — where genuine mispricing lives
+    Pass 2: Medium-volume markets ($5k-$100k) — for arbitrage opportunities
+    Skips high-volume markets (>$100k) — those are efficiently priced by professionals
+    """
+    now      = datetime.now(timezone.utc)
+    all_markets = []
+
     try:
+        # Fetch more markets to find thin ones — sort by ascending volume
         r = requests.get(f"{MYRIAD_API}/markets",
-                         params={"state": "open", "sort": "volume", "order": "desc", "limit": 100},
+                         params={"state": "open", "sort": "volume",
+                                 "order": "asc", "limit": 100},
                          timeout=15)
         r.raise_for_status()
         data    = r.json()
-        markets = data.get("data", data) if isinstance(data, dict) else data
-        now     = datetime.now(timezone.utc)
-        filtered, skip = [], {"perpetual": 0, "network": 0, "expiring": 0}
-        for m in markets:
-            if not m.get("expiresAt"):
-                skip["perpetual"] += 1
-                continue
-            try:
-                exp_dt = datetime.fromisoformat(m["expiresAt"].replace("Z", "+00:00"))
-                if (exp_dt - now).total_seconds() < 6 * 3600:
-                    skip["expiring"] += 1
-                    continue
-            except Exception:
-                pass
-            if str(m.get("networkId", "")) != "56":
-                skip["network"] += 1
-                continue
-            filtered.append(m)
-        logger.info(f"Myriad: {len(markets)} total → {len(filtered)} valid "
-                    f"(skipped: {skip['perpetual']} perpetual, {skip['network']} wrong network, "
-                    f"{skip['expiring']} expiring soon)")
-        return filtered
+        raw     = data.get("data", data) if isinstance(data, dict) else data
+        all_markets.extend(raw)
+
+        # Also fetch descending to catch medium-volume arb opportunities
+        r2 = requests.get(f"{MYRIAD_API}/markets",
+                          params={"state": "open", "sort": "volume",
+                                  "order": "desc", "limit": 100},
+                          timeout=15)
+        r2.raise_for_status()
+        data2 = r2.json()
+        raw2  = data2.get("data", data2) if isinstance(data2, dict) else data2
+        # Deduplicate by id
+        seen_ids = {m.get("id") for m in all_markets}
+        for m in raw2:
+            if m.get("id") not in seen_ids:
+                all_markets.append(m)
+                seen_ids.add(m.get("id"))
+
     except Exception as e:
         logger.error(f"Myriad fetch error: {e}")
-        return []
+        return [], []
+
+    thin, liquid, skip = [], [], {"perpetual": 0, "network": 0, "expiring": 0, "too_high_vol": 0}
+
+    for m in all_markets:
+        if not m.get("expiresAt"):
+            skip["perpetual"] += 1
+            continue
+        try:
+            exp_dt = datetime.fromisoformat(m["expiresAt"].replace("Z", "+00:00"))
+            if (exp_dt - now).total_seconds() < 6 * 3600:
+                skip["expiring"] += 1
+                continue
+        except Exception:
+            pass
+        if str(m.get("networkId", "")) != "56":
+            skip["network"] += 1
+            continue
+
+        vol = float(m.get("volume", 0) or 0)
+        if vol <= 5000:
+            thin.append(m)      # genuine mispricing territory
+        elif vol <= 100000:
+            liquid.append(m)    # arbitrage territory
+        else:
+            skip["too_high_vol"] += 1  # efficiently priced — skip
+
+    logger.info(
+        f"Myriad: {len(all_markets)} total → {len(thin)} thin (<$5k vol) + "
+        f"{len(liquid)} medium ($5k-$100k) valid markets "
+        f"(skipped: {skip['perpetual']} perpetual, {skip['network']} wrong network, "
+        f"{skip['expiring']} expiring, {skip['too_high_vol']} over-traded)"
+    )
+    return thin, liquid
 
 def get_myriad_price(market_id):
     try:
@@ -953,43 +1067,81 @@ def get_myriad_price(market_id):
         logger.error(f"Myriad price error {market_id}: {e}")
     return None, None
 
-def analyze_myriad(markets):
-    if not markets:
-        return None
-    summary    = []
-    for m in markets[:20]:
+def build_myriad_summary(markets, max_markets=15):
+    """Build a summary list from a list of Myriad markets."""
+    summary = []
+    for m in markets[:max_markets]:
         try:
-            outcomes  = {o.get("title", "?"): o.get("price", "?") for o in m.get("outcomes", [])}
-            slug      = m.get("slug", "")
-            mkt_id    = str(m.get("id", ""))
-            direct_url= f"https://myriad.markets/markets/{slug}" if slug else f"https://myriad.markets/markets/{mkt_id}"
-            summary.append({"question": m.get("title", "?"),
-                             "direct_url": direct_url,
-                             "volume_usd": round(float(m.get("volume", 0) or 0), 2),
-                             "outcomes":   outcomes,
-                             "expires":    m.get("expiresAt", "?")})
+            outcomes   = {o.get("title", "?"): o.get("price", "?") for o in m.get("outcomes", [])}
+            slug       = m.get("slug", "")
+            mkt_id     = str(m.get("id", ""))
+            direct_url = (f"https://myriad.markets/markets/{slug}"
+                          if slug else f"https://myriad.markets/markets/{mkt_id}")
+            # Calculate YES+NO sum to flag arbitrage
+            prices = list(outcomes.values())
+            try:
+                price_sum = sum(float(p) for p in prices if p != "?")
+            except Exception:
+                price_sum = 1.0
+            summary.append({
+                "question":   m.get("title", "?"),
+                "direct_url": direct_url,
+                "volume_usd": round(float(m.get("volume", 0) or 0), 2),
+                "outcomes":   outcomes,
+                "price_sum":  round(price_sum, 3),
+                "expires":    m.get("expiresAt", "?"),
+            })
         except Exception:
             continue
+    return summary
+
+def analyze_myriad(thin_markets, liquid_markets):
+    if not thin_markets and not liquid_markets:
+        return None
+
+    thin_summary   = build_myriad_summary(thin_markets, max_markets=15)
+    liquid_summary = build_myriad_summary(liquid_markets, max_markets=10)
 
     prompt = (
-        "You are a sharp, conservative prediction market analyst.\n\n"
-        "Top active Myriad Markets on BNB Chain (perpetuals and near-expired excluded):\n\n"
-        + json.dumps(summary, indent=2)
-        + "\n\nFind markets where odds look clearly wrong, or YES+NO < $0.97 (pure arbitrage).\n"
-        "Only flag genuine edges. Silence is better than noise.\n"
-        "Include the direct_url from the data in your response.\n\n"
+        "You are a prediction market specialist hunting for genuine pricing inefficiencies.\n\n"
+        "You have two sets of markets to analyse:\n\n"
+
+        "═══ SET A: THIN MARKETS (volume under $5,000) ═══\n"
+        "These are lightly traded markets. Smart money hasn't found them yet.\n"
+        "Look for: markets where the current odds are clearly wrong based on real-world "
+        "probability. A market at 90% YES that should realistically be 50/50 is worth flagging. "
+        "A market at 10% YES for something that is almost certain to happen is worth flagging.\n"
+        "These are your HIGHEST PRIORITY targets — this is where real edge lives.\n\n"
+        + json.dumps(thin_summary, indent=2)
+
+        + "\n\n═══ SET B: MEDIUM MARKETS ($5k-$100k volume) ═══\n"
+        "These have more eyes on them. Only flag if:\n"
+        "• YES + NO prices sum to less than $0.97 (pure arbitrage — guaranteed profit)\n"
+        "• OR the mispricing is so obvious it's impossible to miss\n\n"
+        + json.dumps(liquid_summary, indent=2)
+
+        + "\n\nRULES:\n"
+        "• For thin markets: flag anything where you are >60% confident the odds are wrong\n"
+        "• For medium markets: only flag pure arbitrage (price_sum < 0.97) or extreme mispricing\n"
+        "• Always include the direct_url exactly as provided\n"
+        "• Max 4 alerts total. Be specific about WHY the odds are wrong.\n\n"
+
         "For each opportunity use EXACTLY this format:\n\n"
         "ALERT: [market question]\n"
         "MARKET URL: [direct_url]\n"
+        "MARKET TIER: [THIN / MEDIUM]\n"
+        "VOLUME: $[volume]\n"
         "CURRENT ODDS: YES = $[price] / NO = $[price]\n"
-        "WHY IT LOOKS MISPRICED: [2 sentences max]\n"
+        "EDGE TYPE: [MISPRICED / ARBITRAGE / THIN MARKET]\n"
+        "WHY IT LOOKS WRONG: [2-3 sentences — be specific, cite real-world probability]\n"
         "SUGGESTED PLAY: BUY [YES or NO] at $[price]\n"
+        "EXPECTED VALUE: [brief note on what you expect to happen]\n"
         "CONFIDENCE: [Low / Medium / High]\n"
         "---\n\n"
-        "If nothing found respond ONLY with: NO_ALERT"
+        "If nothing found in either set respond ONLY with: NO_ALERT"
     )
     try:
-        resp = client.messages.create(model="claude-sonnet-4-20250514", max_tokens=1000,
+        resp = client.messages.create(model="claude-sonnet-4-20250514", max_tokens=1500,
                                       messages=[{"role": "user", "content": prompt}])
         return resp.content[0].text.strip()
     except Exception as e:
@@ -1050,16 +1202,16 @@ def check_myriad_positions():
 def run_myriad_cycle():
     logger.info("── Myriad cycle starting ──")
     check_myriad_positions()
-    markets = get_myriad_markets()
-    if not markets:
+    thin_markets, liquid_markets = get_myriad_markets()
+    if not thin_markets and not liquid_markets:
+        logger.info("No valid Myriad markets found.")
         return
-    logger.info(f"Fetched {len(markets)} Myriad markets. Analysing...")
-    analysis = analyze_myriad(markets)
+    logger.info(f"Analysing {len(thin_markets)} thin + {len(liquid_markets)} medium markets...")
+    analysis = analyze_myriad(thin_markets, liquid_markets)
     if not analysis or analysis == "NO_ALERT":
         logger.info("No Myriad opportunities this cycle.")
         return
     if "ALERT:" in analysis:
-        # UPGRADE 1: Deduplication
         new_alerts = []
         for block in analysis.split("---"):
             if "ALERT:" not in block:
@@ -1074,7 +1226,6 @@ def run_myriad_cycle():
                 logger.info(f"Myriad duplicate suppressed: {identifier[:40]}")
                 continue
             new_alerts.append(block)
-
         if new_alerts:
             logger.info(f"{len(new_alerts)} new Myriad signal(s). Sending email...")
             send_myriad_email("\n---\n".join(new_alerts))
@@ -1248,24 +1399,38 @@ def send_myriad_email(analysis):
         block = block.strip()
         if not block or "ALERT:" not in block:
             continue
-        inner, market_url = "", ""
+        inner, market_url, tier = "", "", ""
         for line in block.splitlines():
             if line.startswith("ALERT:"):
                 inner += f'<h3 style="margin:0 0 10px;color:#1a1a2e">{line.replace("ALERT:","").strip()}</h3>'
             elif line.startswith("MARKET URL:"):
                 market_url = line.replace("MARKET URL:", "").strip()
+            elif line.startswith("MARKET TIER:"):
+                tier = line.replace("MARKET TIER:", "").strip()
+                tier_col = "#e63946" if tier == "THIN" else "#f4a261"
+                inner += (f'<span style="display:inline-block;background:{tier_col};color:#fff;'
+                          f'font-size:11px;font-weight:bold;padding:2px 8px;border-radius:10px;'
+                          f'margin-bottom:8px">{tier} MARKET</span>')
+            elif line.startswith("VOLUME:"):
+                inner += f'<p style="margin:5px 0;font-size:13px;color:#666"><strong>Volume:</strong> {line.replace("VOLUME:","").strip()}</p>'
             elif line.startswith("CURRENT ODDS:"):
                 inner += f'<p style="margin:5px 0"><strong>Odds:</strong> {line.replace("CURRENT ODDS:","").strip()}</p>'
-            elif line.startswith("WHY IT LOOKS MISPRICED:"):
-                inner += f'<p style="margin:5px 0"><strong>Why:</strong> {line.replace("WHY IT LOOKS MISPRICED:","").strip()}</p>'
+            elif line.startswith("EDGE TYPE:"):
+                edge = line.replace("EDGE TYPE:", "").strip()
+                inner += f'<p style="margin:5px 0"><strong>Edge:</strong> {edge}</p>'
+            elif line.startswith("WHY IT LOOKS WRONG:"):
+                inner += f'<p style="margin:5px 0"><strong>Why:</strong> {line.replace("WHY IT LOOKS WRONG:","").strip()}</p>'
             elif line.startswith("SUGGESTED PLAY:"):
                 val = line.replace("SUGGESTED PLAY:", "").strip()
                 inner += f'<p style="margin:8px 0;font-size:16px;font-weight:bold;color:#2d6a4f">▶ {val}</p>'
+            elif line.startswith("EXPECTED VALUE:"):
+                inner += f'<p style="margin:5px 0;font-style:italic;color:#555">{line.replace("EXPECTED VALUE:","").strip()}</p>'
             elif line.startswith("CONFIDENCE:"):
                 level = line.replace("CONFIDENCE:", "").strip()
                 col   = {"High":"#e63946","Medium":"#f4a261","Low":"#adb5bd"}.get(level,"#adb5bd")
                 inner += f'<p style="margin:5px 0"><strong>Confidence:</strong> <span style="color:{col};font-weight:bold">{level}</span></p>'
         if inner:
+            border = "#e63946" if tier == "THIN" else "#7b2ff7"
             trade_btn = (f'<a href="{market_url}" style="display:inline-block;background:#7b2ff7;'
                          f'color:#fff;padding:10px 20px;text-decoration:none;border-radius:6px;'
                          f'font-size:14px;font-weight:bold;margin-top:12px;margin-right:8px">'
@@ -1273,15 +1438,18 @@ def send_myriad_email(analysis):
             log_btn = (f'<a href="{log_url}/log" style="display:inline-block;background:#2d6a4f;'
                        f'color:#fff;padding:10px 20px;text-decoration:none;border-radius:6px;'
                        f'font-size:14px;font-weight:bold;margin-top:12px">📋 Log Trade</a>') if log_url else ""
-            cards += (f'<div style="background:#f8f9ff;border-left:4px solid #7b2ff7;'
+            cards += (f'<div style="background:#f8f9ff;border-left:4px solid {border};'
                       f'padding:16px;border-radius:6px;margin-bottom:16px">{inner}{trade_btn}{log_btn}</div>')
     html = ('<html><body style="font-family:Arial,sans-serif;max-width:620px;margin:0 auto;padding:24px">'
             '<h2 style="color:#1a1a2e">🔮 Myriad Markets — Opportunity Spotted</h2>'
+            '<p style="color:#666;font-size:13px;margin-bottom:16px">Targeting thin and mispriced markets for maximum edge</p>'
             + cards +
-            '<p style="color:#aaa;font-size:11px;margin-top:24px">Not financial advice.</p>'
+            '<p style="color:#aaa;font-size:11px;margin-top:24px">Not financial advice. '
+            'Thin markets have less liquidity — size positions accordingly.</p>'
             '</body></html>')
     send_email("🔮 Myriad Alert — Opportunity Spotted", html,
                f"Myriad Opportunity\n\n{analysis}\n\nNot financial advice.")
+
 
 def send_crypto_email(analysis, fg: dict = None):
     log_url  = get_log_url()
@@ -1303,6 +1471,7 @@ def send_crypto_email(analysis, fg: dict = None):
             "PRICE:":               lambda v: f'<p style="margin:5px 0"><strong>Price:</strong> {v}</p>',
             "SIGNAL:":              lambda v: f'<p style="margin:8px 0;font-size:18px;font-weight:bold;color:#f7931a">▶ {v}</p>',
             "RSI:":                 lambda v: f'<p style="margin:5px 0"><strong>RSI:</strong> {v}</p>',
+            "FUNDING RATE:":        lambda v: f'<p style="margin:5px 0"><strong>Funding Rate:</strong> {v}</p>',
             "24H CHANGE:":          lambda v: f'<p style="margin:5px 0"><strong>24h:</strong> {v}</p>',
             "WEEKLY TREND:":        lambda v: f'<p style="margin:5px 0"><strong>Weekly:</strong> {v}</p>',
             "FEAR & GREED CONTEXT:":lambda v: f'<p style="margin:5px 0;font-style:italic;color:#666">{v}</p>',
