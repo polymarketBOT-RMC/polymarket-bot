@@ -23,7 +23,7 @@ JSONBIN_API_KEY        = os.environ["JSONBIN_API_KEY"]
 JSONBIN_BIN_ID         = os.environ["JSONBIN_BIN_ID"]
 JSONBIN_HISTORY_BIN_ID = os.environ["JSONBIN_HISTORY_BIN_ID"]
 ALPHAVANTAGE_API_KEY   = os.environ["ALPHAVANTAGE_API_KEY"]
-CHECK_INTERVAL_MINUTES = int(os.environ.get("CHECK_INTERVAL_MINUTES", "30"))
+CHECK_INTERVAL_MINUTES = int(os.environ.get("CHECK_INTERVAL_MINUTES", "15"))
 STOCK_SCAN_HOUR_UTC    = int(os.environ.get("STOCK_SCAN_HOUR_UTC", "23"))
 
 MYRIAD_TP_MULTIPLIER = float(os.environ.get("MYRIAD_TP_MULTIPLIER", "1.8"))
@@ -47,8 +47,10 @@ JSONBIN_URL         = f"https://api.jsonbin.io/v3/b/{JSONBIN_BIN_ID}"
 JSONBIN_HISTORY_URL = f"https://api.jsonbin.io/v3/b/{JSONBIN_HISTORY_BIN_ID}"
 JSONBIN_HEADERS     = {"X-Master-Key": JSONBIN_API_KEY, "Content-Type": "application/json"}
 
-# ── Polymarket API cache ─────────────────────────────────────────────────────
+# ── External prediction market caches ───────────────────────────────────────
 _polymarket_cache: dict = {"ts": 0.0, "markets": []}
+_manifold_cache:   dict = {"ts": 0.0, "markets": []}
+_metaculus_cache:  dict = {"ts": 0.0, "questions": []}
 
 # ── UPGRADE 1: In-memory deduplication cache ────────────────────────────────
 # Stores {signal_hash: datetime_sent} — resets on restart (acceptable)
@@ -1579,7 +1581,9 @@ def get_polymarket_comparison(question: str) -> str:
 
 def research_market(question: str, current_yes_price: float,
                     target_side: str, potential_return: float,
-                    expires_at: str = "", known_poly_price: float = None) -> dict:
+                    expires_at: str = "", known_poly_price: float = None,
+                    known_manifold_price: float = None,
+                    known_metaculus_prob: float = None) -> dict:
     """
     Single-call research pipeline per market.
     Gated by daily API budget cap — set MAX_RESEARCH_CALLS_PER_DAY env var.
@@ -1614,26 +1618,51 @@ def research_market(question: str, current_yes_price: float,
         entry_price   = current_yes_price if target_side == "YES" else 1.0 - current_yes_price
         min_true_prob = entry_price * 100 + min_edge_pp
 
+        # Build known external prices block — reduces searches needed
+        known_prices = []
         if known_poly_price is not None:
-            poly_gap     = (known_poly_price - entry_price) * 100
-            poly_context = (f"POLYMARKET LIVE PRICE (from API): {target_side} = "
-                            f"${known_poly_price:.2f} ({known_poly_price*100:.0f}%) "
-                            f"— gap vs Myriad = {poly_gap:+.1f}pp\n")
+            poly_gap = (known_poly_price - entry_price) * 100
+            known_prices.append(f"  Polymarket {target_side}: {known_poly_price:.2f} "
+                                f"({known_poly_price*100:.0f}%) — gap vs Myriad {poly_gap:+.1f}pp")
+        if known_manifold_price is not None:
+            mf_gap = (known_manifold_price - entry_price) * 100
+            known_prices.append(f"  Manifold {target_side}: {known_manifold_price:.2f} "
+                                f"({known_manifold_price*100:.0f}%) — gap vs Myriad {mf_gap:+.1f}pp")
+        if known_metaculus_prob is not None:
+            mt_entry = known_metaculus_prob if target_side == "YES" else 1.0 - known_metaculus_prob
+            mt_gap   = (mt_entry - entry_price) * 100
+            known_prices.append(f"  Metaculus community median: {known_metaculus_prob:.2f} "
+                                f"({known_metaculus_prob*100:.0f}%) — gap vs Myriad {mt_gap:+.1f}pp")
+
+        known_prices_context = ""
+        if known_prices:
+            known_prices_context = (
+                f"LIVE EXTERNAL PRICES (fetched via API — do not re-search these):\n"
+                + "\n".join(known_prices) + "\n\n"
+            )
+
+        # Determine how many searches Claude needs to do
+        if len(known_prices) >= 2:
             search_block = (
-                f"Do BOTH of these searches (both required, use web_search tool):\n"
-                f"1. Current status/news for: {question}\n"
-                f"2. Check the resolution criteria — is it completely clear what must happen, "
+                f"Do BOTH of these searches (external market prices already provided above):\n"
+                f"1. Current news/status for: {question}\n"
+                f"2. Resolution criteria — is it completely clear what must happen, "
                 f"who decides, and by exactly when? Flag any ambiguity.\n\n"
-                f"Polymarket price already confirmed above via live API — no need to search for it.\n\n"
+            )
+        elif len(known_prices) == 1:
+            search_block = (
+                f"Do BOTH of these searches (one market price already provided above):\n"
+                f"1. Current news/status for: {question}\n"
+                f"2. Resolution criteria — is it completely clear what must happen, "
+                f"who decides, and by exactly when? Flag any ambiguity.\n\n"
             )
         else:
-            poly_context = ""
             search_block = (
                 f"Do ALL THREE of these searches (all required, use web_search tool):\n"
-                f"1. Current status/news for: {question}\n"
+                f"1. Current news/status for: {question}\n"
                 f"2. Search 'site:polymarket.com {question[:60]}' — find the equivalent Polymarket "
                 f"market and report its current {target_side} price as a decimal (e.g. 0.65).\n"
-                f"3. Check the resolution criteria — is it completely clear what must happen, "
+                f"3. Resolution criteria — is it completely clear what must happen, "
                 f"who decides, and by exactly when? Flag any ambiguity.\n\n"
                 f"Myriad implies {entry_price*100:.0f}% for {target_side}. "
                 f"If Polymarket prices {target_side} >10pp higher, that is strong evidence of mispricing.\n"
@@ -1647,8 +1676,13 @@ def research_market(question: str, current_yes_price: float,
             f"MYRIAD: YES=${current_yes_price:.2f} ({current_yes_price*100:.0f}% implied)\n"
             f"TARGET: BUY {target_side} @ ${entry_price:.2f} = {potential_return:.1f}x return\n"
             f"{time_context}\n"
-            f"{poly_context}\n"
+            f"{known_prices_context}"
             + search_block +
+            f"Estimate probability by reasoning in this order:\n"
+            f"1. BASE RATE: What % of comparable events historically resolve YES? (anchor here first)\n"
+            f"2. NEWS UPDATE: Does recent information raise or lower the base rate?\n"
+            f"3. CROSS-MARKET: Do external market prices confirm or contradict your estimate?\n"
+            f"4. SYNTHESIS: Combine the above into your final probability.\n\n"
             f"Need >{min_true_prob:.0f}% true probability to recommend BUY.\n\n"
             f"Reply with ONLY these lines:\n"
             f"TRUE_PROBABILITY: [0-100]%\n"
@@ -1656,7 +1690,7 @@ def research_market(question: str, current_yes_price: float,
             f"EDGE_SIZE: [LARGE/MEDIUM/SMALL/NONE]\n"
             f"KEY_FINDING: [1 sentence]\n"
             f"BASE_RATE: [brief or UNKNOWN]\n"
-            f"CROSS_MARKET: [Polymarket {target_side} price as decimal e.g. 0.65, or not_found]\n"
+            f"CROSS_MARKET: [best external {target_side} price as decimal e.g. 0.65, or not_found]\n"
             f"RESOLUTION_CLARITY: [CLEAR / AMBIGUOUS / UNKNOWN]\n"
             f"TRADE_RECOMMENDATION: [BUY {target_side} / SKIP]\n"
             f"CONFIDENCE: [High/Medium/Low]\n"
@@ -1791,14 +1825,112 @@ def get_polymarket_side_price(poly_market: dict, side: str):
         return None
 
 
-def _research_confirms_edge(research: dict, side: str, entry_price: float) -> bool:
+def fetch_manifold_markets() -> list:
+    """
+    Fetch active binary Manifold Markets. Free API, no key, no geo-restriction.
+    Cached 30 minutes — Manifold has thousands of markets, most overlap with world events.
+    """
+    global _manifold_cache
+    now = time.time()
+    if now - _manifold_cache["ts"] < 1800:
+        return _manifold_cache["markets"]
+    try:
+        r = requests.get("https://manifold.markets/api/v0/markets",
+                         params={"limit": 1000, "sort": "activity"},
+                         timeout=15)
+        r.raise_for_status()
+        markets = [m for m in r.json()
+                   if m.get("outcomeType") == "BINARY" and not m.get("isResolved")]
+        _manifold_cache["ts"]      = now
+        _manifold_cache["markets"] = markets
+        logger.info(f"Manifold API: {len(markets)} active binary markets cached")
+        return markets
+    except Exception as e:
+        logger.error(f"Manifold API fetch error: {e}")
+    return _manifold_cache.get("markets", [])
+
+
+def find_manifold_match(myriad_question: str, manifold_markets: list):
+    """Token-overlap match against Manifold. Same threshold as Polymarket."""
+    best, best_score = None, 0.0
+    for m in manifold_markets:
+        score = _question_similarity(myriad_question, m.get("question", ""))
+        if score > best_score:
+            best_score = score
+            best = m
+    if best_score >= 0.45:
+        return best, best_score
+    return None, 0.0
+
+
+def get_manifold_side_price(manifold_market: dict, side: str):
+    """Manifold probability field is 0-1 YES probability."""
+    try:
+        prob = float(manifold_market.get("probability", 0))
+        return prob if side == "YES" else 1.0 - prob
+    except Exception:
+        return None
+
+
+def fetch_metaculus_questions() -> list:
+    """
+    Fetch open Metaculus binary forecast questions. Free API, no key.
+    Best coverage for geopolitical, scientific, and world-event questions.
+    Cached 60 minutes — Metaculus updates less frequently than prediction markets.
+    """
+    global _metaculus_cache
+    now = time.time()
+    if now - _metaculus_cache["ts"] < 3600:
+        return _metaculus_cache["questions"]
+    try:
+        r = requests.get("https://www.metaculus.com/api2/questions/",
+                         params={"status": "open", "type": "forecast",
+                                 "forecast_type": "binary", "limit": 200},
+                         timeout=15)
+        r.raise_for_status()
+        data      = r.json()
+        questions = data.get("results", []) if isinstance(data, dict) else []
+        _metaculus_cache["ts"]        = now
+        _metaculus_cache["questions"] = questions
+        logger.info(f"Metaculus API: {len(questions)} open binary questions cached")
+        return questions
+    except Exception as e:
+        logger.error(f"Metaculus API fetch error: {e}")
+    return _metaculus_cache.get("questions", [])
+
+
+def find_metaculus_match(myriad_question: str, metaculus_questions: list):
+    """Token-overlap match against Metaculus questions."""
+    best, best_score = None, 0.0
+    for q in metaculus_questions:
+        score = _question_similarity(myriad_question, q.get("title", ""))
+        if score > best_score:
+            best_score = score
+            best = q
+    if best_score >= 0.45:
+        return best, best_score
+    return None, 0.0
+
+
+def get_metaculus_probability(metaculus_q: dict):
+    """Extract median community prediction (q2) from Metaculus question dict."""
+    try:
+        cp   = metaculus_q.get("community_prediction", {}) or {}
+        full = cp.get("full", {}) or {}
+        prob = full.get("q2") or cp.get("q2") or cp.get("prediction")
+        return float(prob) if prob is not None else None
+    except Exception:
+        return None
+
+
+def _research_confirms_edge(research: dict, side: str, entry_price: float,
+                             consensus_sources: int = 0) -> bool:
     """
     Decide whether research confirms a genuine edge.
-    If Polymarket has the market:
-      - Gap >10pp vs Myriad = confirmed cross-market mispricing → alert
-      - Gap ≤10pp = Polymarket agrees with Myriad, no edge → skip
-    If Polymarket not found:
-      - Require LARGE edge only (stricter without cross-market confirmation)
+    Gap threshold scales with consensus:
+      - 2+ sources (Poly + Manifold/Metaculus) agree → accept gap >5pp (strong multi-market signal)
+      - 1 source (Poly or Manifold) → require gap >10pp (current bar)
+      - 0 sources (no external market match) → require LARGE edge from Claude only
     """
     if research["recommendation"] != f"BUY {side}":
         return False
@@ -1815,20 +1947,26 @@ def _research_confirms_edge(research: dict, side: str, entry_price: float) -> bo
         try:
             val = cross.replace("$", "").replace("%", "").split()[0]
             poly_price = float(val)
-            if poly_price > 1.0:          # expressed as percentage e.g. 65
+            if poly_price > 1.0:
                 poly_price = poly_price / 100.0
         except (ValueError, IndexError):
             poly_price = None
 
     if poly_price is not None:
-        poly_implied_pct  = poly_price * 100
+        poly_implied_pct   = poly_price * 100
         myriad_implied_pct = entry_price * 100
-        gap = poly_implied_pct - myriad_implied_pct
-        logger.info(f"  Cross-market: Polymarket {side}={poly_price:.2f} ({poly_implied_pct:.0f}%) "
-                    f"vs Myriad {myriad_implied_pct:.0f}% → gap {gap:+.1f}pp")
-        return gap > 10.0   # confirmed mispricing
+        gap                = poly_implied_pct - myriad_implied_pct
+        # Lower gap threshold when multiple sources independently confirm the mispricing
+        min_gap = 5.0 if consensus_sources >= 2 else 10.0
+        logger.info(f"  Cross-market: {side}={poly_price:.2f} ({poly_implied_pct:.0f}%) "
+                    f"vs Myriad {myriad_implied_pct:.0f}% → gap {gap:+.1f}pp "
+                    f"(need >{min_gap}pp, {consensus_sources} source(s))")
+        return gap > min_gap
     else:
-        # No Polymarket equivalent — require LARGE edge without cross-market backup
+        # No external market — require LARGE edge from Claude without cross-market backup
+        # But if consensus pre-check found a gap, trust that over Claude's LARGE judgment
+        if consensus_sources >= 1:
+            return research["edge_size"] in ("LARGE", "MEDIUM")
         return research["edge_size"] == "LARGE"
 
 
@@ -1896,41 +2034,90 @@ def filter_and_research_markets(thin_markets: list, liquid_markets: list):
     thin_candidates.sort(key=_score_candidate, reverse=True)
     liquid_candidates.sort(key=_score_candidate, reverse=True)
 
-    # Step 2.5: Polymarket API pre-check — compute exact gaps before spending any research calls
-    poly_markets = fetch_polymarket_markets()
-    logger.info(f"Polymarket pre-check against {len(poly_markets)} live markets...")
+    # Step 2.5: Multi-source API pre-check — Polymarket + Manifold + Metaculus
+    # Fetch all three datasets (all cached, no rate limits) before spending any research calls
+    poly_markets     = fetch_polymarket_markets()
+    manifold_markets = fetch_manifold_markets()
+    metaculus_qs     = fetch_metaculus_questions()
+    logger.info(f"Cross-market pre-check: Poly {len(poly_markets)} | "
+                f"Manifold {len(manifold_markets)} | Metaculus {len(metaculus_qs)}...")
 
-    def _enrich_with_poly_gap(candidates):
+    def _enrich_with_cross_market(candidates):
         gap_confirmed, no_match = [], []
         for m in candidates:
             q       = m.get("title", "")
             side    = m.get("_target_side", "YES")
             entry_p = m.get("_entry_price", 0.5)
-            pm, sim = find_polymarket_match(q, poly_markets)
+            gaps_found = 0
+
+            # Polymarket
+            pm, pm_sim = find_polymarket_match(q, poly_markets)
             if pm:
                 poly_price = get_polymarket_side_price(pm, side)
                 if poly_price is not None:
                     gap = (poly_price - entry_p) * 100
-                    m["_poly_price"]    = poly_price
-                    m["_poly_gap"]      = round(gap, 1)
-                    m["_poly_question"] = pm.get("question", "")[:80]
-                    m["_poly_sim"]      = round(sim, 2)
+                    m["_poly_price"] = poly_price
+                    m["_poly_gap"]   = round(gap, 1)
+                    m["_poly_sim"]   = round(pm_sim, 2)
                     if gap > 10.0:
-                        logger.info(f"  ✓ API gap: {q[:40]} | "
-                                    f"Myriad {entry_p*100:.0f}% → Poly {poly_price*100:.0f}% "
-                                    f"| +{gap:.1f}pp (sim {sim:.2f})")
-                        gap_confirmed.append(m)
-                    else:
-                        logger.info(f"  — No gap: {q[:40]} | {gap:+.1f}pp — skipping")
-                    continue
-            no_match.append(m)
-        # Biggest gap first — most valuable arbitrage gets researched first
-        gap_confirmed.sort(key=lambda x: x.get("_poly_gap", 0), reverse=True)
+                        gaps_found += 1
+
+            # Manifold
+            mf, mf_sim = find_manifold_match(q, manifold_markets)
+            if mf:
+                mf_price = get_manifold_side_price(mf, side)
+                if mf_price is not None:
+                    mf_gap = (mf_price - entry_p) * 100
+                    m["_manifold_price"] = mf_price
+                    m["_manifold_gap"]   = round(mf_gap, 1)
+                    m["_manifold_sim"]   = round(mf_sim, 2)
+                    if mf_gap > 10.0:
+                        gaps_found += 1
+
+            # Metaculus
+            mt, mt_sim = find_metaculus_match(q, metaculus_qs)
+            if mt:
+                mt_prob = get_metaculus_probability(mt)
+                if mt_prob is not None:
+                    mt_entry = mt_prob if side == "YES" else 1.0 - mt_prob
+                    mt_gap   = (mt_entry - entry_p) * 100
+                    m["_metaculus_prob"] = mt_prob
+                    m["_metaculus_gap"]  = round(mt_gap, 1)
+                    m["_metaculus_sim"]  = round(mt_sim, 2)
+                    if mt_gap > 10.0:
+                        gaps_found += 1
+
+            m["_consensus_sources"] = gaps_found
+            if gaps_found > 0:
+                sources = []
+                if m.get("_poly_gap", 0) > 10:
+                    sources.append(f"Poly +{m['_poly_gap']:.0f}pp")
+                if m.get("_manifold_gap", 0) > 10:
+                    sources.append(f"Manifold +{m['_manifold_gap']:.0f}pp")
+                if m.get("_metaculus_gap", 0) > 10:
+                    sources.append(f"Metaculus +{m['_metaculus_gap']:.0f}pp")
+                logger.info(f"  ✓ Gap: {q[:38]} | {' | '.join(sources)} [{gaps_found} source(s)]")
+                gap_confirmed.append(m)
+            else:
+                # Only skip if at least one source matched (gap just wasn't big enough)
+                poly_gap = m.get("_poly_gap")
+                if poly_gap is not None:
+                    logger.info(f"  — No gap: {q[:38]} | best {poly_gap:+.1f}pp — skipping")
+                else:
+                    no_match.append(m)
+
+        # Sort: consensus (2+ sources) first, then single-source by gap size
+        gap_confirmed.sort(
+            key=lambda x: (x.get("_consensus_sources", 0),
+                           max(x.get("_poly_gap", 0), x.get("_manifold_gap", 0),
+                               x.get("_metaculus_gap", 0))),
+            reverse=True
+        )
         return gap_confirmed, no_match
 
-    thin_gap,   thin_nomatch   = _enrich_with_poly_gap(thin_candidates)
-    liquid_gap, liquid_nomatch = _enrich_with_poly_gap(liquid_candidates)
-    logger.info(f"  API pre-check: {len(thin_gap)} thin + {len(liquid_gap)} liquid gaps confirmed "
+    thin_gap,   thin_nomatch   = _enrich_with_cross_market(thin_candidates)
+    liquid_gap, liquid_nomatch = _enrich_with_cross_market(liquid_candidates)
+    logger.info(f"  Pre-check: {len(thin_gap)} thin + {len(liquid_gap)} liquid gaps "
                 f"| {len(thin_nomatch)+len(liquid_nomatch)} unmatched")
 
     # Step 3: Research gap-confirmed markets first (pass known price so Claude skips Poly search)
@@ -1952,7 +2139,9 @@ def filter_and_research_markets(thin_markets: list, liquid_markets: list):
         logger.info(f"  Researching: {q[:50]}...")
         _call_start = time.time()
         research = research_market(q, y_price, side, ret, expires,
-                                   known_poly_price=m.get("_poly_price"))
+                                   known_poly_price=m.get("_poly_price"),
+                                   known_manifold_price=m.get("_manifold_price"),
+                                   known_metaculus_prob=m.get("_metaculus_prob"))
         m["_research"] = research
         _elapsed = time.time() - _call_start
         if _elapsed < 65:
@@ -1969,7 +2158,7 @@ def filter_and_research_markets(thin_markets: list, liquid_markets: list):
                 continue
             entry_p = fresh_entry   # use the live price for edge calculation
 
-        if _research_confirms_edge(research, side, entry_p):
+        if _research_confirms_edge(research, side, entry_p, m.get("_consensus_sources", 0)):
             researched_thin.append(m)
             logger.info(f"  ✓ CONFIRMED: {q[:40]} | "
                         f"True: {research['true_prob']}% | Edge: {research['edge_size']} | "
@@ -1988,7 +2177,9 @@ def filter_and_research_markets(thin_markets: list, liquid_markets: list):
         logger.info(f"  Researching liquid: {q[:50]}...")
         _call_start = time.time()
         research = research_market(q, y_price, side, ret, expires,
-                                   known_poly_price=m.get("_poly_price"))
+                                   known_poly_price=m.get("_poly_price"),
+                                   known_manifold_price=m.get("_manifold_price"),
+                                   known_metaculus_prob=m.get("_metaculus_prob"))
         m["_research"] = research
         _elapsed = time.time() - _call_start
         if _elapsed < 65:
@@ -2004,7 +2195,7 @@ def filter_and_research_markets(thin_markets: list, liquid_markets: list):
                 continue
             entry_p = fresh_entry
 
-        if _research_confirms_edge(research, side, entry_p):
+        if _research_confirms_edge(research, side, entry_p, m.get("_consensus_sources", 0)):
             researched_liquid.append(m)
 
     total = len(researched_thin) + len(researched_liquid)
