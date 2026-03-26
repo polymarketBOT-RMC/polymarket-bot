@@ -2441,19 +2441,35 @@ def filter_and_research_markets(thin_markets: list, liquid_markets: list):
     thin_to_research   = thin_gap[:3]   + (thin_nomatch[:1]   if len(thin_gap)   < 3 else [])
     liquid_to_research = liquid_gap[:2] + (liquid_nomatch[:1] if len(liquid_gap) < 2 else [])
 
-    # Consensus bypass: 2+ independent sources confirming a gap is strong enough on its own.
-    # Skip the ~$0.10 Claude API call. Limitation: resolution criteria not verified — check manually.
-    consensus_thin    = [m for m in thin_to_research   if m.get("_consensus_sources", 0) >= 2]
-    consensus_liquid  = [m for m in liquid_to_research if m.get("_consensus_sources", 0) >= 2]
-    thin_to_research   = [m for m in thin_to_research   if m.get("_consensus_sources", 0) < 2]
-    liquid_to_research = [m for m in liquid_to_research if m.get("_consensus_sources", 0) < 2]
+    # Bypass 1: 2+ independent sources confirming a gap — strong enough on its own.
+    # Bypass 2: Single source but gap ≥25pp — so large it's almost certainly genuine.
+    # Both skip the Claude API call entirely. Limitation: resolution criteria not verified.
+    HIGH_CONF_GAP = 25.0  # single-source gap threshold for auto-bypass
+
+    def _best_gap(m):
+        return max(m.get("_poly_gap", 0), m.get("_manifold_gap", 0), m.get("_metaculus_gap", 0))
+
+    def _is_bypass(m):
+        if m.get("_consensus_sources", 0) >= 2:
+            return True
+        if _best_gap(m) >= HIGH_CONF_GAP:
+            return True
+        return False
+
+    consensus_thin    = [m for m in thin_to_research   if _is_bypass(m)]
+    consensus_liquid  = [m for m in liquid_to_research if _is_bypass(m)]
+    thin_to_research   = [m for m in thin_to_research   if not _is_bypass(m)]
+    liquid_to_research = [m for m in liquid_to_research if not _is_bypass(m)]
 
     for m in consensus_thin + consensus_liquid:
         m["_research"] = _build_consensus_research(m)
-        q = m.get("title", "")
-        res = m["_research"]
-        logger.info(f"  ⚡ Consensus bypass: {q[:40]} | True: {res['true_prob']}% | "
-                    f"Edge: {res['edge_size']} | Sources: {m['_consensus_sources']}")
+        q    = m.get("title", "")
+        res  = m["_research"]
+        srcs = m.get("_consensus_sources", 0)
+        gap  = _best_gap(m)
+        reason = (f"{srcs} sources" if srcs >= 2 else f"single source +{gap:.0f}pp ≥ {HIGH_CONF_GAP:.0f}pp threshold")
+        logger.info(f"  ⚡ Auto-bypass: {q[:40]} | True: {res['true_prob']}% | "
+                    f"Edge: {res['edge_size']} | {reason}")
         if m in consensus_thin:
             researched_thin.append(m)
         else:
