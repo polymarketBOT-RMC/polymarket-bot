@@ -1765,8 +1765,8 @@ def research_market(question: str, current_yes_price: float,
 
         try:
             resp = _claude_call(
-                model="claude-sonnet-4-20250514",
-                max_tokens=1500,
+                model="claude-haiku-4-5-20251001",  # haiku: 8x cheaper, same web_search support
+                max_tokens=500,                      # output is ~10 lines = ~80 tokens
                 tools=[{"type": "web_search_20250305", "name": "web_search"}],
                 messages=[{"role": "user", "content": prompt}]
             )
@@ -2057,6 +2057,53 @@ def _research_confirms_edge(research: dict, side: str, entry_price: float,
         return research["edge_size"] == "LARGE"
 
 
+def _build_consensus_research(m: dict) -> dict:
+    """
+    Synthetic research result for markets confirmed by 2+ independent sources.
+    Skips the Claude API call entirely — saves ~$0.10 per signal.
+    Limitation: resolution criteria NOT verified (flagged in key_finding).
+    True probability = average of all available external market prices.
+    """
+    side    = m.get("_target_side", "YES")
+    entry_p = m.get("_entry_price", 0.5)
+
+    prices = []
+    if m.get("_poly_price")     is not None: prices.append(m["_poly_price"])
+    if m.get("_manifold_price") is not None: prices.append(m["_manifold_price"])
+    if m.get("_metaculus_prob") is not None:
+        mt_entry = m["_metaculus_prob"] if side == "YES" else 1.0 - m["_metaculus_prob"]
+        prices.append(mt_entry)
+    true_prob = (sum(prices) / len(prices)) if prices else entry_p + 0.15
+
+    edge_pp   = true_prob * 100 - entry_p * 100
+    edge_size = "LARGE" if edge_pp > 20 else "MEDIUM" if edge_pp > 10 else "SMALL"
+
+    b          = (1.0 / entry_p) - 1.0 if entry_p > 0 else 1.0
+    kelly_f    = (true_prob * b - (1.0 - true_prob)) / b if b > 0 else 0
+    kelly_stake = round(max(0.0, min(kelly_f, 0.25)) * PAPER_STAKE, 2)
+
+    sources = []
+    if m.get("_poly_gap",      0) > 10: sources.append(f"Poly +{m['_poly_gap']:.0f}pp")
+    if m.get("_manifold_gap",  0) > 10: sources.append(f"Manifold +{m['_manifold_gap']:.0f}pp")
+    if m.get("_metaculus_gap", 0) > 10: sources.append(f"Metaculus +{m['_metaculus_gap']:.0f}pp")
+
+    return {
+        "true_prob":          round(true_prob * 100, 1),
+        "edge_pp":            str(round(edge_pp, 1)),
+        "edge_size":          edge_size,
+        "key_finding":        f"⚡ Consensus ({', '.join(sources)}) — resolution criteria not verified",
+        "base_rate":          "N/A (consensus bypass — no API call)",
+        "cross_market":       str(m.get("_poly_price") or m.get("_manifold_price") or "not_found"),
+        "resolution_clarity": "UNKNOWN",
+        "recommendation":     f"BUY {side}",
+        "confidence":         "Medium",
+        "reasoning":          f"{m.get('_consensus_sources', 2)} independent markets agree on mispricing",
+        "kelly_stake":        kelly_stake,
+        "hours_left":         None,
+        "raw":                "",
+    }
+
+
 def _score_candidate(m: dict) -> float:
     """
     Score a candidate market to decide which ones are worth spending research calls on.
@@ -2207,14 +2254,32 @@ def filter_and_research_markets(thin_markets: list, liquid_markets: list):
     logger.info(f"  Pre-check: {len(thin_gap)} thin + {len(liquid_gap)} liquid gaps "
                 f"| {len(thin_nomatch)+len(liquid_nomatch)} unmatched")
 
-    # Step 3: Research gap-confirmed markets first (pass known price so Claude skips Poly search)
-    # Fallback: research 1 unmatched per tier only if gap bucket has fewer than max
+    # Step 3: Research candidates — consensus bypass first (no API cost), then haiku for the rest
     researched_thin   = []
     researched_liquid = []
     thin_to_research   = thin_gap[:3]   + (thin_nomatch[:1]   if len(thin_gap)   < 3 else [])
     liquid_to_research = liquid_gap[:2] + (liquid_nomatch[:1] if len(liquid_gap) < 2 else [])
 
-    logger.info(f"Researching {len(thin_to_research)} thin + {len(liquid_to_research)} liquid candidates...")
+    # Consensus bypass: 2+ independent sources confirming a gap is strong enough on its own.
+    # Skip the ~$0.10 Claude API call. Limitation: resolution criteria not verified — check manually.
+    consensus_thin    = [m for m in thin_to_research   if m.get("_consensus_sources", 0) >= 2]
+    consensus_liquid  = [m for m in liquid_to_research if m.get("_consensus_sources", 0) >= 2]
+    thin_to_research   = [m for m in thin_to_research   if m.get("_consensus_sources", 0) < 2]
+    liquid_to_research = [m for m in liquid_to_research if m.get("_consensus_sources", 0) < 2]
+
+    for m in consensus_thin + consensus_liquid:
+        m["_research"] = _build_consensus_research(m)
+        q = m.get("title", "")
+        res = m["_research"]
+        logger.info(f"  ⚡ Consensus bypass: {q[:40]} | True: {res['true_prob']}% | "
+                    f"Edge: {res['edge_size']} | Sources: {m['_consensus_sources']}")
+        if m in consensus_thin:
+            researched_thin.append(m)
+        else:
+            researched_liquid.append(m)
+
+    logger.info(f"Researching {len(thin_to_research)} thin + {len(liquid_to_research)} liquid candidates "
+                f"({len(consensus_thin)+len(consensus_liquid)} bypassed)...")
 
     for m in thin_to_research:
         q       = m.get("title", "")
