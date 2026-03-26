@@ -2086,6 +2086,73 @@ def _research_confirms_edge(research: dict, side: str, entry_price: float,
         return research["edge_size"] == "LARGE"
 
 
+def _dates_align(myriad_expires: str, external_date, tolerance_days: int = 45) -> bool:
+    """
+    Check that two market expiry dates are within tolerance_days of each other.
+    Accepts ISO string or Unix ms timestamp for external_date.
+    Returns True if aligned (or if date can't be parsed — fail open).
+    """
+    if not myriad_expires or not external_date:
+        return True
+    try:
+        myriad_dt = datetime.fromisoformat(myriad_expires.replace("Z", "+00:00"))
+        if isinstance(external_date, (int, float)):
+            ext_dt = datetime.fromtimestamp(float(external_date) / 1000, tz=timezone.utc)
+        else:
+            ext_dt = datetime.fromisoformat(str(external_date).replace("Z", "+00:00"))
+        return abs((myriad_dt - ext_dt).days) <= tolerance_days
+    except Exception:
+        return True   # can't parse → don't filter
+
+
+def calculate_position_sizing(volume: float, true_prob: float, entry_price: float) -> dict:
+    """
+    Two position sizes shown in every alert:
+
+    safe_stake  — largest bet that won't materially move the market price.
+                  Rule: ≤1% of market volume (causes <1% price impact in typical AMM).
+                  Hard caps by market size to protect micro-markets.
+
+    max_stake   — Kelly-optimal on a $1,000 bankroll, hard-capped at $500.
+                  Only realistic on markets with enough volume to absorb it.
+
+    whale_flag  — True when market can absorb >$200 AND Kelly says bet >$100.
+                  Tells you this is worth sizing up aggressively.
+    """
+    vol = float(volume or 0)
+
+    # Safe stake: 1% of volume, with hard ceilings for very thin markets
+    if vol < 200:
+        safe = 2.0
+    elif vol < 500:
+        safe = 5.0
+    elif vol < 1000:
+        safe = 10.0
+    elif vol < 5000:
+        safe = round(vol * 0.01, 0)   # ~$10-50
+    else:
+        safe = min(round(vol * 0.01, 0), 500.0)
+
+    # Kelly on $1,000 bankroll (half-Kelly for safety)
+    try:
+        p = true_prob / 100.0
+        b = (1.0 / entry_price) - 1.0 if entry_price > 0 else 1.0
+        kelly_f = max(0.0, (p * b - (1.0 - p)) / b) if b > 0 else 0.0
+        kelly_dollar = kelly_f * 0.5 * 1000   # half-Kelly on $1,000
+    except Exception:
+        kelly_dollar = PAPER_STAKE
+
+    max_stake  = round(min(kelly_dollar, 500.0), 0)
+    max_stake  = max(max_stake, safe)   # max is never less than safe
+    whale_flag = vol >= 10_000 and max_stake >= 100
+
+    return {
+        "safe_stake":  round(safe, 0),
+        "max_stake":   max_stake,
+        "whale_flag":  whale_flag,
+    }
+
+
 def _build_consensus_research(m: dict) -> dict:
     """
     Synthetic research result for markets confirmed by 2+ independent sources.
@@ -2213,29 +2280,41 @@ def filter_and_research_markets(thin_markets: list, liquid_markets: list):
             entry_p = m.get("_entry_price", 0.5)
             gaps_found = 0
 
+            myriad_expires = m.get("expiresAt", "")
+
             # Polymarket
             pm, pm_sim = find_polymarket_match(q, poly_markets)
             if pm:
-                poly_price = get_polymarket_side_price(pm, side)
-                if poly_price is not None:
-                    gap = (poly_price - entry_p) * 100
-                    m["_poly_price"] = poly_price
-                    m["_poly_gap"]   = round(gap, 1)
-                    m["_poly_sim"]   = round(pm_sim, 2)
-                    if gap > 10.0:
-                        gaps_found += 1
+                poly_end   = pm.get("endDate") or pm.get("deadline") or pm.get("expirationDate")
+                date_ok    = _dates_align(myriad_expires, poly_end)
+                if not date_ok:
+                    logger.info(f"  — Date mismatch (Poly): {q[:38]} — skipping")
+                else:
+                    poly_price = get_polymarket_side_price(pm, side)
+                    if poly_price is not None:
+                        gap = (poly_price - entry_p) * 100
+                        m["_poly_price"] = poly_price
+                        m["_poly_gap"]   = round(gap, 1)
+                        m["_poly_sim"]   = round(pm_sim, 2)
+                        if gap > 10.0:
+                            gaps_found += 1
 
             # Manifold
             mf, mf_sim = find_manifold_match(q, manifold_markets)
             if mf:
-                mf_price = get_manifold_side_price(mf, side)
-                if mf_price is not None:
-                    mf_gap = (mf_price - entry_p) * 100
-                    m["_manifold_price"] = mf_price
-                    m["_manifold_gap"]   = round(mf_gap, 1)
-                    m["_manifold_sim"]   = round(mf_sim, 2)
-                    if mf_gap > 10.0:
-                        gaps_found += 1
+                mf_close = mf.get("closeTime")   # Unix ms timestamp
+                date_ok  = _dates_align(myriad_expires, mf_close)
+                if not date_ok:
+                    logger.info(f"  — Date mismatch (Manifold): {q[:38]} — skipping")
+                else:
+                    mf_price = get_manifold_side_price(mf, side)
+                    if mf_price is not None:
+                        mf_gap = (mf_price - entry_p) * 100
+                        m["_manifold_price"] = mf_price
+                        m["_manifold_gap"]   = round(mf_gap, 1)
+                        m["_manifold_sim"]   = round(mf_sim, 2)
+                        if mf_gap > 10.0:
+                            gaps_found += 1
 
             # Metaculus
             mt, mt_sim = find_metaculus_match(q, metaculus_qs)
@@ -2425,9 +2504,21 @@ def analyze_myriad(thin_researched, liquid_researched):
         time_str     = f"{hours_left/24:.1f} days ({hours_left:.0f}h)" if hours_left else "unknown"
         edge_pp      = r.get("edge_pp", "?")
 
+        # Position sizing
+        sizing = calculate_position_sizing(float(vol or 0), true_p, price)
+        safe_s = sizing["safe_stake"]
+        max_s  = sizing["max_stake"]
+        whale  = sizing["whale_flag"]
+        sizing_str = (
+            f"{'🐋 WHALE OPPORTUNITY — ' if whale else ''}"
+            f"Safe: ${safe_s:.0f} (no price impact) | "
+            f"Max: ${max_s:.0f} (Kelly on $1k bankroll, capped $500)"
+        )
+
         liquidity_warning = (
-            f"⚠️ LOW LIQUIDITY — vol ${float(vol or 0):.0f} vs ${kelly_stake:.0f} stake. Price impact risk."
-            if float(vol or 0) < kelly_stake * 10 else ""
+            f"⚠️ LOW LIQUIDITY — vol ${float(vol or 0):.0f}. "
+            f"Safe stake is ${safe_s:.0f} — don't exceed without checking order book."
+            if float(vol or 0) < 2000 else ""
         )
 
         poly_gap   = m.get("_poly_gap")
@@ -2460,6 +2551,7 @@ def analyze_myriad(thin_researched, liquid_researched):
             f"KEY FINDING: {finding}",
             f"REASONING: {reasoning}",
             f"EXPECTED VALUE: {ev_str}",
+            f"POSITION SIZING: {sizing_str}",
             f"KELLY STAKE: ${kelly_stake:.0f} suggested (paper trade = ${PAPER_STAKE:.0f})",
             f"EDGE TYPE: RESEARCH-CONFIRMED MISPRICING",
             f"CONFIDENCE: {conf}",
