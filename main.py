@@ -129,7 +129,7 @@ PAPER_STAKE = 20.0  # USD — every signal gets this stake for paper trading
 # Each research call uses haiku + web_search: ~35k input tokens + ~500 output ≈ $0.03
 # Cap is persisted in JSONBin so Railway restarts cannot reset it mid-day.
 # Each restart was previously resetting to 0 — at $0.10/call on sonnet that burned $10+/day.
-MAX_RESEARCH_CALLS_PER_DAY = int(os.environ.get("MAX_RESEARCH_CALLS_PER_DAY", "8"))
+MAX_RESEARCH_CALLS_PER_DAY = int(os.environ.get("MAX_RESEARCH_CALLS_PER_DAY", "10"))
 _research_calls_today = {"date": "", "count": 0, "loaded": False}
 _research_lock = threading.Lock()
 
@@ -1794,8 +1794,8 @@ def research_market(question: str, current_yes_price: float,
 
         try:
             resp = _claude_call(
-                model="claude-haiku-4-5-20251001",  # haiku: 8x cheaper, same web_search support
-                max_tokens=500,                      # output is ~10 lines = ~80 tokens
+                model="claude-sonnet-4-20250514",  # sonnet: better probability calibration for research
+                max_tokens=500,                    # output is ~10 lines = ~80 tokens
                 tools=[{"type": "web_search_20250305", "name": "web_search"}],
                 messages=[{"role": "user", "content": prompt}]
             )
@@ -3110,20 +3110,17 @@ if __name__ == "__main__":
 
     threading.Thread(target=run_flask, daemon=True).start()
 
-    # Staggered startup — prevents hammering CoinGecko/APIs all at once on boot
-    logger.info("Running startup cycles (staggered to avoid rate limits)...")
+    # Startup cycles
+    logger.info("Running startup cycles...")
     run_myriad_cycle()
-    logger.info("Startup: Myriad done. Waiting 90s before crypto scan (CoinGecko rate limit window)...")
-    time.sleep(90)
-    run_crypto_cycle()
-    logger.info("Startup: Crypto done. Waiting 5s before stock scan...")
+    logger.info("Startup: Myriad done. Waiting 5s before stock scan...")
     time.sleep(5)
     run_stock_cycle()
     check_signal_outcomes()
 
     scheduler = BlockingScheduler(timezone="UTC")
     scheduler.add_job(run_myriad_cycle,       "interval", minutes=CHECK_INTERVAL_MINUTES)
-    scheduler.add_job(run_crypto_cycle,       "interval", minutes=CHECK_INTERVAL_MINUTES)
+    # Crypto disabled — budget redirected to higher-quality Myriad research
     scheduler.add_job(run_stock_cycle,        "cron",     hour=STOCK_SCAN_HOUR_UTC, minute=0)
     scheduler.add_job(check_paper_trade_outcomes, "interval", hours=4)
     scheduler.add_job(lambda: check_paper_trade_outcomes(force_email=True),
