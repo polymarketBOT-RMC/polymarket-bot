@@ -86,6 +86,13 @@ _dedup_cache: dict = {}
 _dedup_lock         = threading.Lock()
 DEDUP_HOURS         = 24  # don't repeat same signal within 24 hours
 
+# ── Gap persistence + new market tracking ───────────────────────────────────
+# _gap_history:      {market_id: [utc_timestamps]} — cycles where a gap was found
+# _market_first_seen:{market_id: utc_timestamp}    — first time we saw this market
+_gap_history: dict       = {}
+_gap_history_lock        = threading.Lock()
+_market_first_seen: dict = {}
+
 def signal_hash(identifier: str, direction: str) -> str:
     return hashlib.md5(f"{identifier}:{direction}".encode()).hexdigest()
 
@@ -1894,6 +1901,37 @@ def _question_similarity(q1: str, q2: str) -> float:
     return len(w1 & w2) / max(len(w1), len(w2))
 
 
+def _detect_market_category(question: str) -> str:
+    """
+    Classify a prediction market question into a broad category.
+    Used for category-aware gap thresholds — sports markets are noisier and need
+    a higher bar before we flag a gap as genuine mispricing.
+    """
+    q = question.lower()
+    sports_kw   = {"win", "champion", "championship", "league", "tournament", "cup",
+                   "match", "game", "team", "player", "score", "finals", "playoff",
+                   "football", "soccer", "basketball", "baseball", "tennis", "golf",
+                   "formula", "f1", "nfl", "nba", "nhl", "mlb", "ufc", "boxing",
+                   "cricket", "rugby", "esport", "cs2", "dota", "fifa"}
+    crypto_kw   = {"bitcoin", "btc", "ethereum", "eth", "crypto", "token", "defi",
+                   "nft", "blockchain", "coinbase", "binance", "halving", "satoshi",
+                   "solana", "sol", "xrp", "ripple", "dogecoin", "doge"}
+    political_kw= {"election", "president", "prime minister", "senate", "congress",
+                   "vote", "party", "republican", "democrat", "parliament",
+                   "government", "minister", "candidate", "campaign", "policy",
+                   "legislation", "tariff", "treaty", "war", "ceasefire"}
+    for kw in sports_kw:
+        if kw in q:
+            return "sports"
+    for kw in crypto_kw:
+        if kw in q:
+            return "crypto"
+    for kw in political_kw:
+        if kw in q:
+            return "political"
+    return "general"
+
+
 def find_polymarket_match(myriad_question: str, poly_markets: list):
     """
     Find the best matching Polymarket market for a Myriad question.
@@ -2040,13 +2078,16 @@ def get_metaculus_probability(metaculus_q: dict):
 
 
 def _research_confirms_edge(research: dict, side: str, entry_price: float,
-                             consensus_sources: int = 0) -> bool:
+                             consensus_sources: int = 0, category: str = "general") -> bool:
     """
     Decide whether research confirms a genuine edge.
-    Gap threshold scales with consensus:
-      - 2+ sources (Poly + Manifold/Metaculus) agree → accept gap >5pp (strong multi-market signal)
-      - 1 source (Poly or Manifold) → require gap >10pp (current bar)
-      - 0 sources (no external market match) → require LARGE edge from Claude only
+    Gap threshold scales with consensus AND category:
+      - 2+ sources (Poly + Manifold/Metaculus) agree → accept gap >5pp
+      - 1 source (Poly or Manifold) → category-aware base gap:
+          sports  = 15pp  (noisy markets, outcome variance is high)
+          crypto  = 12pp  (correlated markets, smaller gaps can be real)
+          general = 10pp  (standard bar)
+      - 0 sources → require LARGE edge from Claude only
     """
     if research["recommendation"] != f"BUY {side}":
         return False
@@ -2072,11 +2113,12 @@ def _research_confirms_edge(research: dict, side: str, entry_price: float,
         poly_implied_pct   = poly_price * 100
         myriad_implied_pct = entry_price * 100
         gap                = poly_implied_pct - myriad_implied_pct
-        # Lower gap threshold when multiple sources independently confirm the mispricing
-        min_gap = 5.0 if consensus_sources >= 2 else 10.0
+        # Category-aware base gap — sports markets are noisier, need stronger confirmation
+        base_gap = 15.0 if category == "sports" else 12.0 if category == "crypto" else 10.0
+        min_gap  = 5.0 if consensus_sources >= 2 else base_gap
         logger.info(f"  Cross-market: {side}={poly_price:.2f} ({poly_implied_pct:.0f}%) "
                     f"vs Myriad {myriad_implied_pct:.0f}% → gap {gap:+.1f}pp "
-                    f"(need >{min_gap}pp, {consensus_sources} source(s))")
+                    f"(need >{min_gap}pp, cat={category}, {consensus_sources} source(s))")
         return gap > min_gap
     else:
         # No external market — require LARGE edge from Claude without cross-market backup
@@ -2281,23 +2323,39 @@ def filter_and_research_markets(thin_markets: list, liquid_markets: list):
             gaps_found = 0
 
             myriad_expires = m.get("expiresAt", "")
+            mid    = str(m.get("id", ""))
+            now_ts = time.time()
 
-            # Polymarket
+            # Category detection — used for gap threshold tuning
+            m["_category"] = _detect_market_category(q)
+
+            # New market detection — first time we've ever seen this market ID
+            with _gap_history_lock:
+                if mid not in _market_first_seen:
+                    _market_first_seen[mid] = now_ts
+            m["_is_new_market"] = (now_ts - _market_first_seen.get(mid, now_ts)) < 48 * 3600
+
+            # Polymarket (min $2k volume filter — untraded markets have unreliable prices)
             pm, pm_sim = find_polymarket_match(q, poly_markets)
             if pm:
-                poly_end   = pm.get("endDate") or pm.get("deadline") or pm.get("expirationDate")
-                date_ok    = _dates_align(myriad_expires, poly_end)
-                if not date_ok:
-                    logger.info(f"  — Date mismatch (Poly): {q[:38]} — skipping")
+                poly_vol = float(pm.get("volume", "0") or 0)
+                if poly_vol < 2000:
+                    logger.info(f"  — Poly vol too low (${poly_vol:.0f}): {q[:38]} — skipping match")
                 else:
-                    poly_price = get_polymarket_side_price(pm, side)
-                    if poly_price is not None:
-                        gap = (poly_price - entry_p) * 100
-                        m["_poly_price"] = poly_price
-                        m["_poly_gap"]   = round(gap, 1)
-                        m["_poly_sim"]   = round(pm_sim, 2)
-                        if gap > 10.0:
-                            gaps_found += 1
+                    poly_end   = pm.get("endDate") or pm.get("deadline") or pm.get("expirationDate")
+                    date_ok    = _dates_align(myriad_expires, poly_end)
+                    if not date_ok:
+                        logger.info(f"  — Date mismatch (Poly): {q[:38]} — skipping")
+                    else:
+                        poly_price = get_polymarket_side_price(pm, side)
+                        if poly_price is not None:
+                            gap = (poly_price - entry_p) * 100
+                            m["_poly_price"]  = poly_price
+                            m["_poly_gap"]    = round(gap, 1)
+                            m["_poly_sim"]    = round(pm_sim, 2)
+                            m["_poly_volume"] = round(poly_vol)
+                            if gap > 10.0:
+                                gaps_found += 1
 
             # Manifold
             mf, mf_sim = find_manifold_match(q, manifold_markets)
@@ -2330,6 +2388,19 @@ def filter_and_research_markets(thin_markets: list, liquid_markets: list):
                         gaps_found += 1
 
             m["_consensus_sources"] = gaps_found
+
+            # Gap persistence tracking — how many recent cycles has this gap appeared?
+            with _gap_history_lock:
+                if gaps_found > 0:
+                    hist = _gap_history.get(mid, [])
+                    hist.append(now_ts)
+                    # Keep entries within 8 × interval window (~2h at 15min polling)
+                    cycle_secs = CHECK_INTERVAL_MINUTES * 60 * 8
+                    hist = [t for t in hist if now_ts - t < cycle_secs]
+                    _gap_history[mid] = hist
+                m["_gap_count"]     = len(_gap_history.get(mid, []))
+                m["_gap_persistent"] = m["_gap_count"] >= 3
+
             if gaps_found > 0:
                 sources = []
                 if m.get("_poly_gap", 0) > 10:
@@ -2338,7 +2409,9 @@ def filter_and_research_markets(thin_markets: list, liquid_markets: list):
                     sources.append(f"Manifold +{m['_manifold_gap']:.0f}pp")
                 if m.get("_metaculus_gap", 0) > 10:
                     sources.append(f"Metaculus +{m['_metaculus_gap']:.0f}pp")
-                logger.info(f"  ✓ Gap: {q[:38]} | {' | '.join(sources)} [{gaps_found} source(s)]")
+                persist_str = f" 🔄×{m['_gap_count']}" if m["_gap_persistent"] else ""
+                new_str     = " 🆕" if m.get("_is_new_market") else ""
+                logger.info(f"  ✓ Gap: {q[:38]} | {' | '.join(sources)} [{gaps_found} src]{persist_str}{new_str}")
                 gap_confirmed.append(m)
             else:
                 # Only skip if at least one source matched (gap just wasn't big enough)
@@ -2414,7 +2487,8 @@ def filter_and_research_markets(thin_markets: list, liquid_markets: list):
                 continue
             entry_p = fresh_entry   # use the live price for edge calculation
 
-        if _research_confirms_edge(research, side, entry_p, m.get("_consensus_sources", 0)):
+        if _research_confirms_edge(research, side, entry_p, m.get("_consensus_sources", 0),
+                                    m.get("_category", "general")):
             researched_thin.append(m)
             logger.info(f"  ✓ CONFIRMED: {q[:40]} | "
                         f"True: {research['true_prob']}% | Edge: {research['edge_size']} | "
@@ -2447,7 +2521,8 @@ def filter_and_research_markets(thin_markets: list, liquid_markets: list):
                 continue
             entry_p = fresh_entry
 
-        if _research_confirms_edge(research, side, entry_p, m.get("_consensus_sources", 0)):
+        if _research_confirms_edge(research, side, entry_p, m.get("_consensus_sources", 0),
+                                    m.get("_category", "general")):
             researched_liquid.append(m)
 
     total = len(researched_thin) + len(researched_liquid)
@@ -2531,12 +2606,27 @@ def analyze_myriad(thin_researched, liquid_researched):
         else:
             poly_api_str = "not matched"
 
+        # New market / gap persistence / category badges
+        category     = m.get("_category", "general").upper()
+        is_new       = m.get("_is_new_market", False)
+        gap_count    = m.get("_gap_count", 0)
+        gap_persist  = m.get("_gap_persistent", False)
+        poly_vol_str = (f"${m['_poly_volume']:,}" if m.get("_poly_volume") else "unknown")
+
+        new_badge  = "🆕 YES — appeared <48h ago, fresh mispricing window" if is_new else "No"
+        gap_badge  = (f"🔄 YES — confirmed {gap_count}× consecutive cycles (strong conviction)"
+                      if gap_persist else f"No ({gap_count} cycle{'s' if gap_count != 1 else ''})")
+
         block = "\n".join([
             f"ALERT: {m.get('title','?')}",
             f"MARKET URL: {url}",
             f"MARKET ID: {mkt_id}",
             f"MARKET TIER: {tier}",
+            f"CATEGORY: {category}",
+            f"NEW MARKET: {new_badge}",
+            f"GAP PERSISTENCE: {gap_badge}",
             f"POLYMARKET API: {poly_api_str}",
+            f"POLYMARKET VOLUME: {poly_vol_str}",
             f"LIQUIDITY WARNING: {liquidity_warning}",
             f"VOLUME: ${float(vol or 0):.0f}",
             f"TIME REMAINING: {time_str}",
@@ -2611,8 +2701,80 @@ def check_myriad_positions():
         save_positions(updated_all)
         send_sell_email(alerts)
 
+def check_gap_exits():
+    """
+    Scan open myriad paper trades: if the Polymarket gap that generated the signal
+    has now closed (Myriad price converged to within 5pp of Polymarket), the mispricing
+    has corrected and it's time to take profit.
+    Emits a sell alert when: gap < 5pp AND position is >3% profitable.
+    """
+    try:
+        poly_markets = fetch_polymarket_markets()
+        if not poly_markets:
+            return
+        history = load_history()
+        alerts  = []
+        changed = False
+        for item in history:
+            if item.get("type") != "paper_trade" or item.get("resolved"):
+                continue
+            if item.get("market_type") != "myriad":
+                continue
+            if item.get("gap_exit_alerted"):
+                continue
+            identifier = item.get("identifier", "")
+            direction  = item.get("direction", "BUY YES")
+            entry      = float(item.get("price_at_signal", 0))
+            market_id  = item.get("market_id", "")
+            if not identifier or not entry or not market_id:
+                continue
+
+            side = "YES" if "YES" in direction.upper() else "NO"
+
+            # Get live Myriad price
+            current_yes, _ = get_myriad_price(market_id)
+            if current_yes is None:
+                continue
+            current_price = current_yes if side == "YES" else 1.0 - current_yes
+
+            # Find Polymarket equivalent
+            pm, sim = find_polymarket_match(identifier, poly_markets)
+            if pm is None or sim < 0.45:
+                continue
+            poly_price = get_polymarket_side_price(pm, side)
+            if poly_price is None:
+                continue
+
+            current_gap = (poly_price - current_price) * 100
+            pnl_pct     = (current_price - entry) / entry * 100 if entry > 0 else 0
+
+            # Fire exit alert when gap has closed AND we're profitable
+            if current_gap < 5.0 and pnl_pct > 3.0:
+                alerts.append(
+                    f"GAP CLOSED — TAKE PROFIT\n"
+                    f"Market: {identifier[:70]}\n"
+                    f"Side: {side} | Entry: ${entry:.3f} | Now: ${current_price:.3f}\n"
+                    f"P&L: +{pnl_pct:.1f}%\n"
+                    f"Polymarket: ${poly_price:.2f} | Gap now: {current_gap:+.1f}pp\n"
+                    f"The mispricing has corrected — the edge that generated this signal is gone.\n"
+                    f"ACTION: Consider closing now to lock in profit."
+                )
+                item["gap_exit_alerted"] = True
+                changed = True
+                logger.info(f"Gap exit: {identifier[:40]} | P&L +{pnl_pct:.1f}% | gap now {current_gap:+.1f}pp")
+
+        if changed:
+            save_history(history)
+        if alerts:
+            send_sell_email(alerts)
+            logger.info(f"Gap exit alerts: {len(alerts)} sent")
+    except Exception as e:
+        logger.error(f"Gap exit check error: {e}")
+
+
 def run_myriad_cycle():
     logger.info("── Myriad cycle starting ──")
+    check_gap_exits()   # check if any open positions' gaps have closed
     check_myriad_positions()
     thin_markets, liquid_markets = get_myriad_markets()
     if not thin_markets and not liquid_markets:
@@ -2861,7 +3023,8 @@ def send_myriad_email(analysis):
                            "MARKET IMPLIES","RESEARCH ESTIMATE","EDGE","BASE RATE",
                            "CROSS-MARKET","KEY FINDING","REASONING","EXPECTED VALUE",
                            "KELLY STAKE","EDGE TYPE","CONFIDENCE","LIQUIDITY WARNING",
-                           "POLYMARKET API"]:
+                           "POLYMARKET API","POLYMARKET VOLUME","CATEGORY",
+                           "NEW MARKET","GAP PERSISTENCE","POSITION SIZING"]:
                 if line.startswith(prefix + ":"):
                     fields[prefix] = line.replace(prefix + ":", "").strip()
 
@@ -2892,19 +3055,43 @@ def send_myriad_email(analysis):
         except Exception:
             prob_bar = ""
 
+        # Build special highlight badges for new markets + persistent gaps
+        has_new     = fields.get("NEW MARKET","").startswith("🆕")
+        has_persist = fields.get("GAP PERSISTENCE","").startswith("🔄")
+        cat         = fields.get("CATEGORY", "GENERAL")
+        cat_col     = {"SPORTS":"#d62828","CRYPTO":"#f7931a","POLITICAL":"#023e8a"}.get(cat,"#555")
+
+        top_badges = ""
+        if has_new:
+            top_badges += (
+                f'<div style="background:#e8f5e9;border:1px solid #2d6a4f;border-radius:6px;'
+                f'padding:8px 12px;margin:6px 0;font-size:13px;font-weight:bold;color:#2d6a4f">'
+                f'🆕 NEW MARKET — appeared &lt;48h ago. Fresh mispricing window, act quickly.</div>'
+            )
+        if has_persist:
+            top_badges += (
+                f'<div style="background:#e3f2fd;border:1px solid #1565c0;border-radius:6px;'
+                f'padding:8px 12px;margin:6px 0;font-size:13px;font-weight:bold;color:#1565c0">'
+                f'{fields["GAP PERSISTENCE"]}</div>'
+            )
+
         inner = (
             f'<h3 style="margin:0 0 8px;color:#1a1a2e;font-size:15px">{fields.get("ALERT","")}</h3>'
             f'<div style="margin-bottom:8px">'
             f'<span style="background:{tier_col};color:#fff;font-size:11px;font-weight:bold;'
             f'padding:2px 8px;border-radius:10px;margin-right:6px">{tier} MARKET</span>'
+            f'<span style="background:#f0f2ff;color:{cat_col};font-size:11px;font-weight:bold;'
+            f'padding:2px 8px;border-radius:10px;margin-right:6px">{cat}</span>'
             f'<span style="background:#f0f2ff;color:#4361ee;font-size:11px;font-weight:bold;'
             f'padding:2px 8px;border-radius:10px">Vol: {fields.get("VOLUME","?")}</span>'
             f'<span style="background:#fff3e0;color:#e65100;font-size:11px;font-weight:bold;'
             f'padding:2px 8px;border-radius:10px;margin-left:6px">⏱ {fields.get("TIME REMAINING","?")}</span>'
             f'</div>'
+            + top_badges
             + (f'<div style="background:#e8f5e9;border-left:4px solid #2d6a4f;border-radius:4px;'
                f'padding:8px 12px;margin:8px 0;font-size:13px">'
-               f'<strong>🔗 Polymarket (live API):</strong> {fields["POLYMARKET API"]}</div>'
+               f'<strong>🔗 Polymarket (live API):</strong> {fields["POLYMARKET API"]}'
+               f' &nbsp;|&nbsp; <strong>Poly Vol:</strong> {fields.get("POLYMARKET VOLUME","?")}</div>'
                if fields.get("POLYMARKET API") and "not matched" not in fields.get("POLYMARKET API","") else '')
             + prob_bar
             + f'<p style="margin:6px 0"><strong>Odds:</strong> {fields.get("CURRENT ODDS","?")}</p>'
@@ -2917,6 +3104,7 @@ def send_myriad_email(analysis):
             f'<p style="margin:3px 0;font-size:13px"><strong>🔄 Cross-Market:</strong> {fields.get("CROSS-MARKET","not checked")}</p>'
             f'<p style="margin:3px 0;font-size:12px;color:#555;font-style:italic">{fields.get("REASONING","")}</p>'
             f'</div>'
+            f'<p style="margin:4px 0;font-size:13px"><strong>💰 Position Sizing:</strong> {fields.get("POSITION SIZING","?")}</p>'
             f'<p style="margin:4px 0;font-size:13px"><strong>💰 Kelly Stake:</strong> {fields.get("KELLY STAKE","?")}</p>'
             f'<p style="margin:4px 0;font-size:13px"><strong>Confidence:</strong> '
             f'<span style="color:{conf_col};font-weight:bold">{conf}</span></p>'
