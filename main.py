@@ -93,6 +93,17 @@ _gap_history: dict       = {}
 _gap_history_lock        = threading.Lock()
 _market_first_seen: dict = {}
 
+# ── Volume momentum tracking ─────────────────────────────────────────────────
+# {market_id: [(timestamp, volume)]} — rolling 2-hour volume snapshots
+_market_volume_history: dict = {}
+
+# ── Gap-widening re-alert tracking ───────────────────────────────────────────
+# {market_id: gap_pp_at_last_alert} — so we can re-alert when gap grows ≥10pp
+_last_alert_gap: dict = {}
+
+# ── External market caches ───────────────────────────────────────────────────
+_kalshi_cache: dict = {"ts": 0.0, "markets": []}
+
 def signal_hash(identifier: str, direction: str) -> str:
     return hashlib.md5(f"{identifier}:{direction}".encode()).hexdigest()
 
@@ -1671,7 +1682,8 @@ def research_market(question: str, current_yes_price: float,
                     target_side: str, potential_return: float,
                     expires_at: str = "", known_poly_price: float = None,
                     known_manifold_price: float = None,
-                    known_metaculus_prob: float = None) -> dict:
+                    known_metaculus_prob: float = None,
+                    known_kalshi_price: float = None) -> dict:
     """
     Single-call research pipeline per market.
     Gated by daily API budget cap — set MAX_RESEARCH_CALLS_PER_DAY env var.
@@ -1730,6 +1742,10 @@ def research_market(question: str, current_yes_price: float,
             mf_gap = (known_manifold_price - entry_price) * 100
             known_prices.append(f"  Manifold {target_side}: {known_manifold_price:.2f} "
                                 f"({known_manifold_price*100:.0f}%) — gap vs Myriad {mf_gap:+.1f}pp")
+        if known_kalshi_price is not None:
+            kl_gap = (known_kalshi_price - entry_price) * 100
+            known_prices.append(f"  Kalshi {target_side}: {known_kalshi_price:.2f} "
+                                f"({known_kalshi_price*100:.0f}%) — gap vs Myriad {kl_gap:+.1f}pp")
         if known_metaculus_prob is not None:
             mt_entry = known_metaculus_prob if target_side == "YES" else 1.0 - known_metaculus_prob
             mt_gap   = (mt_entry - entry_price) * 100
@@ -1930,6 +1946,102 @@ def _detect_market_category(question: str) -> str:
         if kw in q:
             return "political"
     return "general"
+
+
+def _check_volume_momentum(market_id: str, current_vol: float) -> dict:
+    """
+    Track rolling volume per market. A spike (≥50% growth, ≥$100 new money)
+    means informed traders are entering — treat as a signal even without a
+    cross-market gap.
+    """
+    now  = time.time()
+    hist = _market_volume_history.get(market_id, [])
+    hist.append((now, current_vol))
+    hist = [(t, v) for t, v in hist if now - t < 7200]   # 2-hour window
+    _market_volume_history[market_id] = hist
+    if len(hist) < 2:
+        return {"spike": False, "growth_pct": 0.0, "new_volume": 0.0}
+    oldest_vol  = hist[0][1]
+    new_volume  = current_vol - oldest_vol
+    if oldest_vol <= 0:
+        return {"spike": False, "growth_pct": 0.0, "new_volume": new_volume}
+    growth_pct  = new_volume / oldest_vol * 100
+    spike       = growth_pct >= 50.0 and new_volume >= 100.0
+    return {"spike": spike, "growth_pct": round(growth_pct, 1), "new_volume": round(new_volume, 0)}
+
+
+def fetch_kalshi_markets() -> list:
+    """
+    Fetch open Kalshi prediction markets. Public REST API, no key required for reads.
+    Cached 30 minutes. Prices are in cents (0-100) — divide by 100 for 0-1.
+    """
+    global _kalshi_cache
+    now = time.time()
+    if now - _kalshi_cache["ts"] < 1800:
+        return _kalshi_cache["markets"]
+    try:
+        markets, cursor = [], ""
+        for _ in range(5):   # max 1000 markets (5 × 200)
+            params = {"status": "open", "limit": 200}
+            if cursor:
+                params["cursor"] = cursor
+            r = requests.get("https://trading-api.kalshi.com/trade-api/v2/markets",
+                             params=params, timeout=15)
+            if r.status_code == 401:
+                logger.warning("Kalshi API requires auth — skipping")
+                return _kalshi_cache.get("markets", [])
+            if r.status_code == 429:
+                logger.warning("Kalshi rate limited — skipping")
+                return _kalshi_cache.get("markets", [])
+            r.raise_for_status()
+            data  = r.json()
+            batch = data.get("markets", [])
+            markets.extend([m for m in batch
+                            if m.get("yes_ask") is not None or m.get("last_price") is not None])
+            cursor = data.get("cursor", "")
+            if not cursor or len(batch) < 200:
+                break
+        _kalshi_cache["ts"]      = now
+        _kalshi_cache["markets"] = markets
+        logger.info(f"Kalshi API: {len(markets)} open markets cached")
+        return markets
+    except Exception as e:
+        logger.error(f"Kalshi API fetch error: {e}")
+    return _kalshi_cache.get("markets", [])
+
+
+def find_kalshi_match(myriad_question: str, kalshi_markets: list):
+    """Token-overlap match against Kalshi market titles. Same threshold as Polymarket."""
+    best, best_score = None, 0.0
+    for m in kalshi_markets:
+        score = _question_similarity(myriad_question, m.get("title", ""))
+        if score > best_score:
+            best_score = score
+            best = m
+    if best_score >= 0.45:
+        return best, best_score
+    return None, 0.0
+
+
+def get_kalshi_side_price(kalshi_market: dict, side: str):
+    """
+    Extract YES or NO probability from a Kalshi market.
+    Prices are integers in cents (0-100) — convert to 0-1 decimal.
+    Uses bid/ask midpoint if available, otherwise last_price.
+    """
+    try:
+        yes_ask = kalshi_market.get("yes_ask")
+        yes_bid = kalshi_market.get("yes_bid")
+        last    = kalshi_market.get("last_price")
+        if yes_ask is not None and yes_bid is not None:
+            yes_price = (float(yes_ask) + float(yes_bid)) / 2 / 100.0
+        elif last is not None:
+            yes_price = float(last) / 100.0
+        else:
+            return None
+        return yes_price if side == "YES" else 1.0 - yes_price
+    except Exception:
+        return None
 
 
 def find_polymarket_match(myriad_question: str, poly_markets: list):
@@ -2208,6 +2320,7 @@ def _build_consensus_research(m: dict) -> dict:
     prices = []
     if m.get("_poly_price")     is not None: prices.append(m["_poly_price"])
     if m.get("_manifold_price") is not None: prices.append(m["_manifold_price"])
+    if m.get("_kalshi_price")   is not None: prices.append(m["_kalshi_price"])
     if m.get("_metaculus_prob") is not None:
         mt_entry = m["_metaculus_prob"] if side == "YES" else 1.0 - m["_metaculus_prob"]
         prices.append(mt_entry)
@@ -2223,6 +2336,7 @@ def _build_consensus_research(m: dict) -> dict:
     sources = []
     if m.get("_poly_gap",      0) > 10: sources.append(f"Poly +{m['_poly_gap']:.0f}pp")
     if m.get("_manifold_gap",  0) > 10: sources.append(f"Manifold +{m['_manifold_gap']:.0f}pp")
+    if m.get("_kalshi_gap",    0) > 10: sources.append(f"Kalshi +{m['_kalshi_gap']:.0f}pp")
     if m.get("_metaculus_gap", 0) > 10: sources.append(f"Metaculus +{m['_metaculus_gap']:.0f}pp")
 
     return {
@@ -2311,8 +2425,10 @@ def filter_and_research_markets(thin_markets: list, liquid_markets: list):
     poly_markets     = fetch_polymarket_markets()
     manifold_markets = fetch_manifold_markets()
     metaculus_qs     = fetch_metaculus_questions()
+    kalshi_markets   = fetch_kalshi_markets()
     logger.info(f"Cross-market pre-check: Poly {len(poly_markets)} | "
-                f"Manifold {len(manifold_markets)} | Metaculus {len(metaculus_qs)}...")
+                f"Manifold {len(manifold_markets)} | Kalshi {len(kalshi_markets)} | "
+                f"Metaculus {len(metaculus_qs)}...")
 
     def _enrich_with_cross_market(candidates):
         gap_confirmed, no_match = [], []
@@ -2374,6 +2490,23 @@ def filter_and_research_markets(thin_markets: list, liquid_markets: list):
                         if mf_gap > 10.0:
                             gaps_found += 1
 
+            # Kalshi
+            kl, kl_sim = find_kalshi_match(q, kalshi_markets)
+            if kl:
+                kl_close = kl.get("close_time") or kl.get("expiration_time")
+                date_ok  = _dates_align(myriad_expires, kl_close)
+                if not date_ok:
+                    logger.info(f"  — Date mismatch (Kalshi): {q[:38]} — skipping")
+                else:
+                    kl_price = get_kalshi_side_price(kl, side)
+                    if kl_price is not None:
+                        kl_gap = (kl_price - entry_p) * 100
+                        m["_kalshi_price"] = kl_price
+                        m["_kalshi_gap"]   = round(kl_gap, 1)
+                        m["_kalshi_sim"]   = round(kl_sim, 2)
+                        if kl_gap > 10.0:
+                            gaps_found += 1
+
             # Metaculus
             mt, mt_sim = find_metaculus_match(q, metaculus_qs)
             if mt:
@@ -2386,6 +2519,12 @@ def filter_and_research_markets(thin_markets: list, liquid_markets: list):
                     m["_metaculus_sim"]  = round(mt_sim, 2)
                     if mt_gap > 10.0:
                         gaps_found += 1
+
+            # Volume momentum — track volume changes cycle-over-cycle
+            vol_mom = _check_volume_momentum(mid, float(m.get("volume", 0) or 0))
+            m["_vol_spike"]      = vol_mom["spike"]
+            m["_vol_growth_pct"] = vol_mom["growth_pct"]
+            m["_vol_new_usd"]    = vol_mom["new_volume"]
 
             m["_consensus_sources"] = gaps_found
 
@@ -2403,31 +2542,37 @@ def filter_and_research_markets(thin_markets: list, liquid_markets: list):
 
             if gaps_found > 0:
                 sources = []
-                if m.get("_poly_gap", 0) > 10:
-                    sources.append(f"Poly +{m['_poly_gap']:.0f}pp")
-                if m.get("_manifold_gap", 0) > 10:
-                    sources.append(f"Manifold +{m['_manifold_gap']:.0f}pp")
-                if m.get("_metaculus_gap", 0) > 10:
-                    sources.append(f"Metaculus +{m['_metaculus_gap']:.0f}pp")
+                if m.get("_poly_gap",      0) > 10: sources.append(f"Poly +{m['_poly_gap']:.0f}pp")
+                if m.get("_manifold_gap",  0) > 10: sources.append(f"Manifold +{m['_manifold_gap']:.0f}pp")
+                if m.get("_kalshi_gap",    0) > 10: sources.append(f"Kalshi +{m['_kalshi_gap']:.0f}pp")
+                if m.get("_metaculus_gap", 0) > 10: sources.append(f"Metaculus +{m['_metaculus_gap']:.0f}pp")
                 persist_str = f" 🔄×{m['_gap_count']}" if m["_gap_persistent"] else ""
                 new_str     = " 🆕" if m.get("_is_new_market") else ""
-                logger.info(f"  ✓ Gap: {q[:38]} | {' | '.join(sources)} [{gaps_found} src]{persist_str}{new_str}")
+                vol_str     = f" 🔥+{m['_vol_growth_pct']:.0f}%vol" if m.get("_vol_spike") else ""
+                logger.info(f"  ✓ Gap: {q[:38]} | {' | '.join(sources)} [{gaps_found} src]{persist_str}{new_str}{vol_str}")
                 gap_confirmed.append(m)
             else:
-                # Only skip if at least one source matched (gap just wasn't big enough)
-                poly_gap = m.get("_poly_gap")
-                if poly_gap is not None:
-                    logger.info(f"  — No gap: {q[:38]} | best {poly_gap:+.1f}pp — skipping")
+                any_matched = any(m.get(k) is not None for k in ("_poly_gap","_manifold_gap","_kalshi_gap","_metaculus_gap"))
+                if any_matched:
+                    best = max(m.get("_poly_gap",0), m.get("_manifold_gap",0),
+                               m.get("_kalshi_gap",0), m.get("_metaculus_gap",0))
+                    logger.info(f"  — No gap: {q[:38]} | best {best:+.1f}pp — skipping")
+                elif m.get("_vol_spike"):
+                    # Volume spike with no external match — still worth researching
+                    logger.info(f"  🔥 Vol spike: {q[:38]} | +{m['_vol_growth_pct']:.0f}% (${m['_vol_new_usd']:.0f} new) — adding to research")
+                    no_match.append(m)
                 else:
                     no_match.append(m)
 
-        # Sort: consensus (2+ sources) first, then single-source by gap size
+        # Sort: consensus (2+ sources) first, then single-source by gap size, vol spikes prioritised
         gap_confirmed.sort(
             key=lambda x: (x.get("_consensus_sources", 0),
                            max(x.get("_poly_gap", 0), x.get("_manifold_gap", 0),
-                               x.get("_metaculus_gap", 0))),
+                               x.get("_kalshi_gap", 0), x.get("_metaculus_gap", 0))),
             reverse=True
         )
+        # Vol spike markets rise to top of no_match list
+        no_match.sort(key=lambda x: x.get("_vol_spike", False), reverse=True)
         return gap_confirmed, no_match
 
     thin_gap,   thin_nomatch   = _enrich_with_cross_market(thin_candidates)
@@ -2447,7 +2592,8 @@ def filter_and_research_markets(thin_markets: list, liquid_markets: list):
     HIGH_CONF_GAP = 25.0  # single-source gap threshold for auto-bypass
 
     def _best_gap(m):
-        return max(m.get("_poly_gap", 0), m.get("_manifold_gap", 0), m.get("_metaculus_gap", 0))
+        return max(m.get("_poly_gap", 0), m.get("_manifold_gap", 0),
+                   m.get("_kalshi_gap", 0), m.get("_metaculus_gap", 0))
 
     def _is_bypass(m):
         if m.get("_consensus_sources", 0) >= 2:
@@ -2489,7 +2635,8 @@ def filter_and_research_markets(thin_markets: list, liquid_markets: list):
         research = research_market(q, y_price, side, ret, expires,
                                    known_poly_price=m.get("_poly_price"),
                                    known_manifold_price=m.get("_manifold_price"),
-                                   known_metaculus_prob=m.get("_metaculus_prob"))
+                                   known_metaculus_prob=m.get("_metaculus_prob"),
+                                   known_kalshi_price=m.get("_kalshi_price"))
         m["_research"] = research
 
         # Price staleness check — re-fetch live price; abort if it moved >5pp during research
@@ -2524,7 +2671,8 @@ def filter_and_research_markets(thin_markets: list, liquid_markets: list):
         research = research_market(q, y_price, side, ret, expires,
                                    known_poly_price=m.get("_poly_price"),
                                    known_manifold_price=m.get("_manifold_price"),
-                                   known_metaculus_prob=m.get("_metaculus_prob"))
+                                   known_metaculus_prob=m.get("_metaculus_prob"),
+                                   known_kalshi_price=m.get("_kalshi_price"))
         m["_research"] = research
 
         entry_p = m.get("_entry_price", 0.5)
@@ -2622,16 +2770,23 @@ def analyze_myriad(thin_researched, liquid_researched):
         else:
             poly_api_str = "not matched"
 
-        # New market / gap persistence / category badges
+        # New market / gap persistence / category / volume spike badges
         category     = m.get("_category", "general").upper()
         is_new       = m.get("_is_new_market", False)
         gap_count    = m.get("_gap_count", 0)
         gap_persist  = m.get("_gap_persistent", False)
         poly_vol_str = (f"${m['_poly_volume']:,}" if m.get("_poly_volume") else "unknown")
+        best_gap_pp  = max(m.get("_poly_gap",0), m.get("_manifold_gap",0),
+                           m.get("_kalshi_gap",0), m.get("_metaculus_gap",0))
+        vol_spike    = m.get("_vol_spike", False)
+        vol_growth   = m.get("_vol_growth_pct", 0)
+        vol_new      = m.get("_vol_new_usd", 0)
 
-        new_badge  = "🆕 YES — appeared <48h ago, fresh mispricing window" if is_new else "No"
-        gap_badge  = (f"🔄 YES — confirmed {gap_count}× consecutive cycles (strong conviction)"
-                      if gap_persist else f"No ({gap_count} cycle{'s' if gap_count != 1 else ''})")
+        new_badge   = "🆕 YES — appeared <48h ago, fresh mispricing window" if is_new else "No"
+        gap_badge   = (f"🔄 YES — confirmed {gap_count}× consecutive cycles (strong conviction)"
+                       if gap_persist else f"No ({gap_count} cycle{'s' if gap_count != 1 else ''})")
+        spike_badge = (f"🔥 YES — +{vol_growth:.0f}% growth (${vol_new:.0f} new in 2h)"
+                       if vol_spike else "No")
 
         block = "\n".join([
             f"ALERT: {m.get('title','?')}",
@@ -2639,8 +2794,10 @@ def analyze_myriad(thin_researched, liquid_researched):
             f"MARKET ID: {mkt_id}",
             f"MARKET TIER: {tier}",
             f"CATEGORY: {category}",
+            f"BEST GAP PP: {best_gap_pp:.1f}",
             f"NEW MARKET: {new_badge}",
             f"GAP PERSISTENCE: {gap_badge}",
+            f"VOLUME SPIKE: {spike_badge}",
             f"POLYMARKET API: {poly_api_str}",
             f"POLYMARKET VOLUME: {poly_vol_str}",
             f"LIQUIDITY WARNING: {liquidity_warning}",
@@ -2810,15 +2967,36 @@ def run_myriad_cycle():
         for block in analysis.split("---"):
             if "ALERT:" not in block:
                 continue
-            alert_line = [l for l in block.splitlines() if l.startswith("ALERT:")]
-            play_line  = [l for l in block.splitlines() if l.startswith("SUGGESTED PLAY:")]
+            alert_line  = [l for l in block.splitlines() if l.startswith("ALERT:")]
+            play_line   = [l for l in block.splitlines() if l.startswith("SUGGESTED PLAY:")]
+            mktid_line  = [l for l in block.splitlines() if l.startswith("MARKET ID:")]
+            gap_line    = [l for l in block.splitlines() if l.startswith("BEST GAP PP:")]
             if not alert_line:
                 continue
-            identifier = alert_line[0].replace("ALERT:", "").strip()[:80]
-            direction  = play_line[0].replace("SUGGESTED PLAY:", "").strip()[:10] if play_line else "BUY YES"
+            identifier  = alert_line[0].replace("ALERT:", "").strip()[:80]
+            direction   = play_line[0].replace("SUGGESTED PLAY:", "").strip()[:10] if play_line else "BUY YES"
+            mkt_id_val  = mktid_line[0].replace("MARKET ID:", "").strip() if mktid_line else ""
+            try:
+                current_gap = float(gap_line[0].replace("BEST GAP PP:", "").strip()) if gap_line else 0.0
+            except Exception:
+                current_gap = 0.0
+
             if is_duplicate(identifier, direction):
-                logger.info(f"Myriad duplicate suppressed: {identifier[:40]}")
-                continue
+                # Re-alert if the gap has widened ≥10pp since last alert — new information
+                last_gap = _last_alert_gap.get(mkt_id_val, 0.0)
+                if mkt_id_val and current_gap - last_gap >= 10.0:
+                    logger.info(f"Gap widened {last_gap:.0f}pp → {current_gap:.0f}pp — re-alerting: {identifier[:40]}")
+                    h = signal_hash(identifier, direction)
+                    with _dedup_lock:
+                        if h in _dedup_cache:
+                            del _dedup_cache[h]
+                    # Fall through — don't continue
+                else:
+                    logger.info(f"Myriad duplicate suppressed: {identifier[:40]}")
+                    continue
+
+            if mkt_id_val:
+                _last_alert_gap[mkt_id_val] = current_gap
 
             # Extract price and research data for paper trade logging
             price_line    = [l for l in block.splitlines() if l.startswith("SUGGESTED PLAY:")]
@@ -3040,7 +3218,8 @@ def send_myriad_email(analysis):
                            "CROSS-MARKET","KEY FINDING","REASONING","EXPECTED VALUE",
                            "KELLY STAKE","EDGE TYPE","CONFIDENCE","LIQUIDITY WARNING",
                            "POLYMARKET API","POLYMARKET VOLUME","CATEGORY",
-                           "NEW MARKET","GAP PERSISTENCE","POSITION SIZING"]:
+                           "NEW MARKET","GAP PERSISTENCE","VOLUME SPIKE",
+                           "BEST GAP PP","POSITION SIZING"]:
                 if line.startswith(prefix + ":"):
                     fields[prefix] = line.replace(prefix + ":", "").strip()
 
@@ -3089,6 +3268,12 @@ def send_myriad_email(analysis):
                 f'<div style="background:#e3f2fd;border:1px solid #1565c0;border-radius:6px;'
                 f'padding:8px 12px;margin:6px 0;font-size:13px;font-weight:bold;color:#1565c0">'
                 f'{fields["GAP PERSISTENCE"]}</div>'
+            )
+        if fields.get("VOLUME SPIKE","").startswith("🔥"):
+            top_badges += (
+                f'<div style="background:#fff3e0;border:1px solid #e65100;border-radius:6px;'
+                f'padding:8px 12px;margin:6px 0;font-size:13px;font-weight:bold;color:#e65100">'
+                f'{fields["VOLUME SPIKE"]} — informed traders may be entering</div>'
             )
 
         inner = (
