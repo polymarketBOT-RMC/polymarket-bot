@@ -126,25 +126,54 @@ def get_fear_and_greed() -> dict:
 PAPER_STAKE = 20.0  # USD — every signal gets this stake for paper trading
 
 # ── API cost control ─────────────────────────────────────────────────────────
-# Approximate cost per research call: ~1500 tokens in + 400 out ≈ $0.006
-# At 5 markets per cycle × 48 cycles/day = up to 240 calls/day = ~$1.44/day
-# Daily cap prevents runaway costs. Set via env var or default to 20 calls/day.
-MAX_RESEARCH_CALLS_PER_DAY = int(os.environ.get("MAX_RESEARCH_CALLS_PER_DAY", "20"))
-_research_calls_today = {"date": "", "count": 0}
+# Each research call uses haiku + web_search: ~35k input tokens + ~500 output ≈ $0.03
+# Cap is persisted in JSONBin so Railway restarts cannot reset it mid-day.
+# Each restart was previously resetting to 0 — at $0.10/call on sonnet that burned $10+/day.
+MAX_RESEARCH_CALLS_PER_DAY = int(os.environ.get("MAX_RESEARCH_CALLS_PER_DAY", "8"))
+_research_calls_today = {"date": "", "count": 0, "loaded": False}
 _research_lock = threading.Lock()
 
+def _load_research_count():
+    """Pull today's research count from JSONBin — called once per UTC day (on first can_research())."""
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    try:
+        r = _jsonbin_get(JSONBIN_URL)
+        if r.status_code == 200:
+            rt = r.json().get("record", {}).get("research_today", {})
+            if rt.get("date") == today:
+                count = int(rt.get("count", 0))
+                logger.info(f"Research count restored from storage: {count}/{MAX_RESEARCH_CALLS_PER_DAY} used today")
+                return count
+    except Exception as e:
+        logger.warning(f"Research count load failed (using 0): {e}")
+    return 0
+
+def _save_research_count(count):
+    """Persist today's research count into the positions JSONBin bin."""
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    try:
+        r = _jsonbin_get(JSONBIN_URL)
+        if r.status_code == 200:
+            record = r.json().get("record", {})
+            record["research_today"] = {"date": today, "count": count}
+            _jsonbin_put(JSONBIN_URL, record)
+    except Exception as e:
+        logger.warning(f"Research count save failed: {e}")
+
 def can_research() -> bool:
-    """Check if we're within today's research call budget."""
+    """Check if we're within today's research call budget. Count persists across restarts."""
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     with _research_lock:
-        if _research_calls_today["date"] != today:
-            _research_calls_today["date"]  = today
-            _research_calls_today["count"] = 0
+        # On first call each UTC day (or after restart), load from JSONBin
+        if not _research_calls_today["loaded"] or _research_calls_today["date"] != today:
+            _research_calls_today["date"]   = today
+            _research_calls_today["count"]  = _load_research_count()
+            _research_calls_today["loaded"] = True
         if _research_calls_today["count"] >= MAX_RESEARCH_CALLS_PER_DAY:
-            logger.warning(f"Daily research cap reached ({MAX_RESEARCH_CALLS_PER_DAY} calls). "
-                           f"Skipping research this cycle.")
+            logger.warning(f"Daily research cap reached ({MAX_RESEARCH_CALLS_PER_DAY} calls). Skipping.")
             return False
         _research_calls_today["count"] += 1
+        _save_research_count(_research_calls_today["count"])
         remaining = MAX_RESEARCH_CALLS_PER_DAY - _research_calls_today["count"]
         logger.info(f"Research call {_research_calls_today['count']}/{MAX_RESEARCH_CALLS_PER_DAY} "
                     f"today ({remaining} remaining)")
