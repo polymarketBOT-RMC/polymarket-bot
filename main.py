@@ -1841,6 +1841,7 @@ def research_market(question: str, current_yes_price: float,
         try:
             true_prob = float(parsed.get("TRUE_PROBABILITY","0").replace("%","").strip())
         except Exception:
+            logger.warning(f"Malformed Claude response for '{question[:40]}' — TRUE_PROBABILITY unparseable. Raw: {result_text[:200]}")
             true_prob = 0.0
 
         kelly_stake = kelly_criterion(true_prob, entry_price) if true_prob > 0 else PAPER_STAKE
@@ -2331,7 +2332,8 @@ def _build_consensus_research(m: dict) -> dict:
 
     b          = (1.0 / entry_p) - 1.0 if entry_p > 0 else 1.0
     kelly_f    = (true_prob * b - (1.0 - true_prob)) / b if b > 0 else 0
-    kelly_stake = round(max(0.0, min(kelly_f, 0.25)) * PAPER_STAKE, 2)
+    half_kelly  = kelly_f / 2  # consistent with research path
+    kelly_stake = round(max(0.0, min(half_kelly, 0.25)) * PAPER_STAKE, 2)
 
     sources = []
     if m.get("_poly_gap",      0) > 10: sources.append(f"Poly +{m['_poly_gap']:.0f}pp")
@@ -2838,6 +2840,7 @@ def check_myriad_positions():
         market = pos.get("market", "?")
         current_yes, expires_at = get_myriad_price(market_id)
         if current_yes is None:
+            logger.warning(f"Could not fetch price for Myriad position: {market} ({market_id})")
             continue
         current    = current_yes if side == "YES" else (1.0 - current_yes)
         pnl_pct    = ((current - entry) / entry) * 100
@@ -2947,6 +2950,7 @@ def check_gap_exits():
 
 def run_myriad_cycle():
     logger.info("── Myriad cycle starting ──")
+    prune_dedup_cache()
     check_gap_exits()   # check if any open positions' gaps have closed
     check_myriad_positions()
     thin_markets, liquid_markets = get_myriad_markets()
@@ -3149,6 +3153,7 @@ def check_stock_positions():
 
 def run_stock_cycle():
     logger.info("── Daily stock scan starting ──")
+    prune_dedup_cache()
     check_stock_positions()
     logger.info(f"Scanning stocks: {STOCK_WATCHLIST}")
     all_data = [get_stock_data(t) for t in STOCK_WATCHLIST]
