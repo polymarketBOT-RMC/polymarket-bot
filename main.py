@@ -99,7 +99,32 @@ _market_volume_history: dict = {}
 
 # ── Gap-widening re-alert tracking ───────────────────────────────────────────
 # {market_id: gap_pp_at_last_alert} — so we can re-alert when gap grows ≥10pp
+# Persisted to JSONBin so state survives restarts
 _last_alert_gap: dict = {}
+
+def _load_alert_gaps():
+    """Load persisted gap-alert state from JSONBin on startup."""
+    global _last_alert_gap
+    try:
+        r = _jsonbin_get(JSONBIN_URL)
+        if r.status_code == 200:
+            gaps = r.json().get("record", {}).get("alert_gaps", {})
+            if isinstance(gaps, dict):
+                _last_alert_gap = gaps
+                logger.info(f"Gap alert state restored: {len(gaps)} markets")
+    except Exception as e:
+        logger.warning(f"Gap alert state load failed (using empty): {e}")
+
+def _save_alert_gaps():
+    """Persist current gap-alert state to JSONBin."""
+    try:
+        r = _jsonbin_get(JSONBIN_URL)
+        if r.status_code == 200:
+            record = r.json().get("record", {})
+            record["alert_gaps"] = _last_alert_gap
+            _jsonbin_put(JSONBIN_URL, record)
+    except Exception as e:
+        logger.warning(f"Gap alert state save failed: {e}")
 
 # ── External market caches ───────────────────────────────────────────────────
 _kalshi_cache: dict = {"ts": 0.0, "markets": []}
@@ -1233,9 +1258,17 @@ def build_crypto_summaries_concurrent(top_coins: list) -> list:
     needs_ohlc.sort(key=lambda x: x[0], reverse=True)
     needs_ohlc = [s for _, s in needs_ohlc[:6]]  # max 6 OHLC calls per cycle
 
-    logger.info(f"Fetching OHLC sequentially for {len(needs_ohlc)} top candidates (7s gap)...")
-    for s in needs_ohlc:
-        ohlc = get_coin_ohlc_sequential(s["coin_id"])
+    logger.info(f"Fetching OHLC for {len(needs_ohlc)} top candidates (2 workers, staggered)...")
+
+    def _fetch_ohlc_staggered(idx_and_coin):
+        idx, s = idx_and_coin
+        time.sleep(idx * 4)  # stagger: worker 0 starts now, worker 1 starts 4s later
+        return s, get_coin_ohlc_sequential(s["coin_id"])
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(_fetch_ohlc_staggered, enumerate(needs_ohlc)))
+
+    for s, ohlc in results:
         rsi  = ohlc.get("rsi_14")
         sma50= ohlc.get("sma_50")
         if rsi:
@@ -1244,7 +1277,6 @@ def build_crypto_summaries_concurrent(top_coins: list) -> list:
         if sma50:
             s["sma_50"]  = sma50
             s["vs_sma50"]= "above" if s["price"] > sma50 else "below"
-        time.sleep(7)  # 7-second gap — stays well within CoinGecko free tier
 
     return summaries
 
@@ -2651,6 +2683,9 @@ def filter_and_research_markets(thin_markets: list, liquid_markets: list):
                 logger.info(f"  ✗ Stale — price moved {moved_pp:.1f}pp during research, skipping")
                 continue
             entry_p = fresh_entry   # use the live price for edge calculation
+            # Update edge_pp to reflect the fresh entry price so alerts log correct value
+            if research.get("true_prob", 0) > 0:
+                research["edge_pp"] = str(round(research["true_prob"] - fresh_entry * 100, 1))
 
         if _research_confirms_edge(research, side, entry_p, m.get("_consensus_sources", 0),
                                     m.get("_category", "general")):
@@ -2686,6 +2721,8 @@ def filter_and_research_markets(thin_markets: list, liquid_markets: list):
                 logger.info(f"  ✗ Stale — price moved {moved_pp:.1f}pp during research, skipping")
                 continue
             entry_p = fresh_entry
+            if research.get("true_prob", 0) > 0:
+                research["edge_pp"] = str(round(research["true_prob"] - fresh_entry * 100, 1))
 
         if _research_confirms_edge(research, side, entry_p, m.get("_consensus_sources", 0),
                                     m.get("_category", "general")):
@@ -3001,6 +3038,7 @@ def run_myriad_cycle():
 
             if mkt_id_val:
                 _last_alert_gap[mkt_id_val] = current_gap
+                _save_alert_gaps()
 
             # Extract price and research data for paper trade logging
             price_line    = [l for l in block.splitlines() if l.startswith("SUGGESTED PLAY:")]
@@ -3595,6 +3633,9 @@ if __name__ == "__main__":
                 "waitress | conviction | btc-filter | outcomes | weekly-trend")
 
     threading.Thread(target=run_flask, daemon=True).start()
+
+    # Restore persisted state
+    _load_alert_gaps()
 
     # Startup cycles
     logger.info("Running startup cycles...")
