@@ -102,6 +102,13 @@ _market_volume_history: dict = {}
 # Persisted to JSONBin so state survives restarts
 _last_alert_gap: dict = {}
 
+# ── Research result cache ─────────────────────────────────────────────────────
+# {market_id: {"recommendation": "...", "true_prob": X, "edge_size": "...", "at": iso_str}}
+# Prevents re-spending budget on markets researched within the last 6 hours.
+# After 6h, re-researches so stale SKIP/BUY opinions get refreshed.
+_research_cache: dict = {}
+RESEARCH_REUSE_HOURS = 6
+
 def _load_alert_gaps():
     """Load persisted gap-alert state from JSONBin on startup."""
     global _last_alert_gap
@@ -125,6 +132,57 @@ def _save_alert_gaps():
             _jsonbin_put(JSONBIN_URL, record)
     except Exception as e:
         logger.warning(f"Gap alert state save failed: {e}")
+
+def _load_research_cache():
+    """Load persisted research cache from JSONBin on startup."""
+    global _research_cache
+    try:
+        r = _jsonbin_get(JSONBIN_URL)
+        if r.status_code == 200:
+            cache = r.json().get("record", {}).get("research_cache", {})
+            if isinstance(cache, dict):
+                # Prune entries older than 24h on load to keep the bin small
+                cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+                _research_cache = {k: v for k, v in cache.items()
+                                   if v.get("at", "") >= cutoff}
+                logger.info(f"Research cache restored: {len(_research_cache)} entries")
+    except Exception as e:
+        logger.warning(f"Research cache load failed (using empty): {e}")
+
+def _save_research_cache():
+    """Persist research cache to JSONBin."""
+    try:
+        r = _jsonbin_get(JSONBIN_URL)
+        if r.status_code == 200:
+            record = r.json().get("record", {})
+            record["research_cache"] = _research_cache
+            _jsonbin_put(JSONBIN_URL, record)
+    except Exception as e:
+        logger.warning(f"Research cache save failed: {e}")
+
+def _get_cached_research(market_id: str) -> dict | None:
+    """Return cached research if still fresh (< RESEARCH_REUSE_HOURS old), else None."""
+    entry = _research_cache.get(str(market_id))
+    if not entry:
+        return None
+    try:
+        cached_at = datetime.fromisoformat(entry["at"])
+        age_hours = (datetime.now(timezone.utc) - cached_at).total_seconds() / 3600
+        if age_hours < RESEARCH_REUSE_HOURS:
+            return entry
+    except Exception:
+        pass
+    return None
+
+def _cache_research(market_id: str, research: dict):
+    """Store research result in cache with current timestamp."""
+    _research_cache[str(market_id)] = {
+        "recommendation": research.get("recommendation", "SKIP"),
+        "true_prob":      research.get("true_prob", 0),
+        "edge_size":      research.get("edge_size", "UNKNOWN"),
+        "at":             datetime.now(timezone.utc).isoformat(),
+    }
+    _save_research_cache()
 
 # ── External market caches ───────────────────────────────────────────────────
 _kalshi_cache: dict = {"ts": 0.0, "markets": []}
@@ -2664,13 +2722,25 @@ def filter_and_research_markets(thin_markets: list, liquid_markets: list):
         side    = m.get("_target_side", "YES")
         ret     = m.get("_potential_return", 2.3)
         expires = m.get("expiresAt", "")
+        mkt_id  = str(m.get("id", ""))
 
-        logger.info(f"  Researching: {q[:50]}...")
-        research = research_market(q, y_price, side, ret, expires,
-                                   known_poly_price=m.get("_poly_price"),
-                                   known_manifold_price=m.get("_manifold_price"),
-                                   known_metaculus_prob=m.get("_metaculus_prob"),
-                                   known_kalshi_price=m.get("_kalshi_price"))
+        cached = _get_cached_research(mkt_id)
+        if cached:
+            logger.info(f"  ♻ Cache hit ({RESEARCH_REUSE_HOURS}h): {q[:40]} | "
+                        f"True: {cached['true_prob']}% | {cached['recommendation']}")
+            # Reconstruct minimal research dict from cache so downstream code works
+            research = {**cached, "edge_pp": "0", "key_finding": "(cached)",
+                        "base_rate": "N/A", "cross_market": "not_found",
+                        "resolution_clarity": "UNKNOWN", "reasoning": "",
+                        "kelly_stake": PAPER_STAKE, "hours_left": None, "raw": ""}
+        else:
+            logger.info(f"  Researching: {q[:50]}...")
+            research = research_market(q, y_price, side, ret, expires,
+                                       known_poly_price=m.get("_poly_price"),
+                                       known_manifold_price=m.get("_manifold_price"),
+                                       known_metaculus_prob=m.get("_metaculus_prob"),
+                                       known_kalshi_price=m.get("_kalshi_price"))
+            _cache_research(mkt_id, research)
         m["_research"] = research
 
         # Price staleness check — re-fetch live price; abort if it moved >5pp during research
@@ -2703,13 +2773,24 @@ def filter_and_research_markets(thin_markets: list, liquid_markets: list):
         side    = m.get("_target_side", "YES")
         ret     = m.get("_potential_return", 2.3)
         expires = m.get("expiresAt", "")
+        mkt_id  = str(m.get("id", ""))
 
-        logger.info(f"  Researching liquid: {q[:50]}...")
-        research = research_market(q, y_price, side, ret, expires,
-                                   known_poly_price=m.get("_poly_price"),
-                                   known_manifold_price=m.get("_manifold_price"),
-                                   known_metaculus_prob=m.get("_metaculus_prob"),
-                                   known_kalshi_price=m.get("_kalshi_price"))
+        cached = _get_cached_research(mkt_id)
+        if cached:
+            logger.info(f"  ♻ Cache hit ({RESEARCH_REUSE_HOURS}h): {q[:40]} | "
+                        f"True: {cached['true_prob']}% | {cached['recommendation']}")
+            research = {**cached, "edge_pp": "0", "key_finding": "(cached)",
+                        "base_rate": "N/A", "cross_market": "not_found",
+                        "resolution_clarity": "UNKNOWN", "reasoning": "",
+                        "kelly_stake": PAPER_STAKE, "hours_left": None, "raw": ""}
+        else:
+            logger.info(f"  Researching liquid: {q[:50]}...")
+            research = research_market(q, y_price, side, ret, expires,
+                                       known_poly_price=m.get("_poly_price"),
+                                       known_manifold_price=m.get("_manifold_price"),
+                                       known_metaculus_prob=m.get("_metaculus_prob"),
+                                       known_kalshi_price=m.get("_kalshi_price"))
+            _cache_research(mkt_id, research)
         m["_research"] = research
 
         entry_p = m.get("_entry_price", 0.5)
@@ -3636,6 +3717,7 @@ if __name__ == "__main__":
 
     # Restore persisted state
     _load_alert_gaps()
+    _load_research_cache()
 
     # Startup cycles
     logger.info("Running startup cycles...")
