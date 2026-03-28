@@ -3066,7 +3066,10 @@ def check_gap_exits():
         logger.error(f"Gap exit check error: {e}")
 
 
+_last_cycle_time: str = "never"
+
 def run_myriad_cycle():
+    global _last_cycle_time
     logger.info("── Myriad cycle starting ──")
     prune_dedup_cache()
     check_gap_exits()   # check if any open positions' gaps have closed
@@ -3078,6 +3081,8 @@ def run_myriad_cycle():
 
     # Full pipeline: value filter → web research → confirmation
     thin_confirmed, liquid_confirmed = filter_and_research_markets(thin_markets, liquid_markets)
+
+    _last_cycle_time = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
 
     analysis = analyze_myriad(thin_confirmed, liquid_confirmed)
     if not analysis or analysis == "NO_ALERT":
@@ -3703,6 +3708,62 @@ def run_flask():
     logger.info(f"Starting Waitress production server on port {port}")
     serve(app, host="0.0.0.0", port=port, threads=4)
 
+def send_health_check():
+    """Daily health check email — 01:00 UTC (08:00 Bangkok). Always sends."""
+    try:
+        # Check JSONBin readable
+        r = _jsonbin_get(JSONBIN_URL)
+        jsonbin_ok = r.status_code == 200
+        positions  = []
+        research_count = 0
+        if jsonbin_ok:
+            data = r.json().get("record", {})
+            positions      = data.get("positions", [])
+            research_today = data.get("research_today", {})
+            today          = datetime.utcnow().strftime("%Y-%m-%d")
+            if research_today.get("date") == today:
+                research_count = research_today.get("count", 0)
+
+        # Check history bin readable
+        rh = _jsonbin_get(JSONBIN_HISTORY_URL)
+        history_ok = rh.status_code == 200
+        total_trades = 0
+        if history_ok:
+            trades = rh.json().get("record", {}).get("trades", [])
+            total_trades = len(trades)
+
+        status = "✅ All systems OK" if (jsonbin_ok and history_ok) else "⚠️ Issues detected"
+        issues = []
+        if not jsonbin_ok:   issues.append("❌ JSONBin positions bin unreachable")
+        if not history_ok:   issues.append("❌ JSONBin history bin unreachable")
+
+        plain = (
+            f"Myriad Bot — Daily Health Check\n\n"
+            f"Status: {status}\n"
+            f"Last cycle: {_last_cycle_time}\n"
+            f"Open positions: {len(positions)}\n"
+            f"Total paper trades logged: {total_trades}\n"
+            f"Research calls today: {research_count}/{MAX_RESEARCH_CALLS_PER_DAY}\n"
+        )
+        if issues:
+            plain += "\nIssues:\n" + "\n".join(issues)
+        if positions:
+            plain += "\n\nOpen positions:\n"
+            for p in positions:
+                plain += f"  • {p.get('market','?')[:50]} | {p.get('side','?')} @ {p.get('entry_price','?')}\n"
+
+        html = plain.replace("\n", "<br>")
+        send_email("☀️ Myriad Bot — Morning Health Check", html, plain)
+        logger.info("Health check email sent.")
+    except Exception as e:
+        logger.error(f"Health check failed: {e}")
+        try:
+            send_email("⚠️ Myriad Bot — Health Check FAILED",
+                       f"Health check error: {e}", f"Health check error: {e}")
+        except Exception:
+            pass
+
+
 if __name__ == "__main__":
     logger.info("═══════════════════════════════════════")
     logger.info("  Combined Signal Bot v2 — UPGRADED")
@@ -3734,6 +3795,7 @@ if __name__ == "__main__":
     scheduler.add_job(check_paper_trade_outcomes, "interval", hours=4)
     scheduler.add_job(lambda: check_paper_trade_outcomes(force_email=True),
                       "cron", day_of_week="mon,thu", hour=8, minute=0)  # Mon+Thu 8am UTC = 3pm Bangkok
+    scheduler.add_job(send_health_check,               "cron", hour=1,  minute=0)   # 08:00 Bangkok
     scheduler.add_job(lambda: send_report("daily"),   "cron", hour=23, minute=0)
     scheduler.add_job(lambda: send_report("weekly"),  "cron", day_of_week="mon", hour=23, minute=30)
     scheduler.add_job(lambda: send_report("monthly"), "cron", day=1, hour=23, minute=45)
