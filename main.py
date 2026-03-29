@@ -3775,6 +3775,26 @@ def send_health_check():
             pass
 
 
+def _cleanup_duplicate_paper_trades():
+    """
+    One-time cleanup: remove all paper_trade entries from history.
+    They were all duplicates due to a bug — each market was logged every 15 min.
+    Manual positions (type != paper_trade) are preserved.
+    Safe to run on every startup — does nothing if no paper_trades found.
+    """
+    try:
+        history = load_history()
+        paper   = [t for t in history if t.get("type") == "paper_trade"]
+        keep    = [t for t in history if t.get("type") != "paper_trade"]
+        if paper:
+            save_history(keep)
+            logger.info(f"Cleaned {len(paper)} duplicate paper trades — {len(keep)} manual entries kept")
+        else:
+            logger.info("Paper trade cleanup: nothing to remove")
+    except Exception as e:
+        logger.warning(f"Paper trade cleanup failed: {e}")
+
+
 if __name__ == "__main__":
     logger.info("═══════════════════════════════════════")
     logger.info("  Combined Signal Bot v2 — UPGRADED")
@@ -3786,6 +3806,9 @@ if __name__ == "__main__":
                 "waitress | conviction | btc-filter | outcomes | weekly-trend")
 
     threading.Thread(target=run_flask, daemon=True).start()
+
+    # One-time cleanup of duplicate paper trades
+    _cleanup_duplicate_paper_trades()
 
     # Restore persisted state
     _load_alert_gaps()
