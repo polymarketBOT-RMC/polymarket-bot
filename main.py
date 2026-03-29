@@ -293,6 +293,17 @@ def log_signal(identifier: str, signal_type: str, direction: str,
         sig_id   = signal_hash(identifier, direction)
         now      = datetime.now(timezone.utc).isoformat()
 
+        # Only one open paper trade per market/direction — skip if already open
+        already_open = any(
+            h.get("type") == "paper_trade"
+            and not h.get("resolved")
+            and h.get("id") == sig_id
+            for h in history
+        )
+        if already_open:
+            logger.debug(f"Paper trade already open for {identifier[:40]} — skipping duplicate")
+            return
+
         # Expected value calculation
         # If buying YES at $price with true_prob% chance of $1 payout:
         # EV = (true_prob * 1.0) - price
