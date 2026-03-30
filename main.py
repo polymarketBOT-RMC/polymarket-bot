@@ -2807,8 +2807,13 @@ def filter_and_research_markets(thin_markets: list, liquid_markets: list):
             mid    = str(m.get("id", ""))
             now_ts = time.time()
 
-            # Category detection — used for gap threshold tuning
+            # Category detection — used for gap threshold tuning and filtering
             m["_category"] = _detect_market_category(q)
+
+            # Skip sports markets — heavily efficient, no edge without specialist data
+            if m["_category"] == "sports":
+                logger.debug(f"Sports filter: skipping '{q[:60]}'")
+                continue
 
             # New market detection — first time we've ever seen this market ID
             with _gap_history_lock:
