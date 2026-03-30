@@ -389,6 +389,9 @@ def check_paper_trade_outcomes(force_email=False):
                             item["outcome"]     = "WIN" if win else "LOSS"
                             resolved.append(item)
                             updates.append(item)
+                            # Post-mortem analysis for losses
+                            if not win and not item.get("postmortem"):
+                                _analyze_failed_paper_trade(item)
                 except Exception as e:
                     logger.error(f"Myriad price check error: {e}")
 
@@ -1779,12 +1782,194 @@ def get_polymarket_comparison(question: str) -> str:
     return "NOT_FOUND"
 
 
+# ── Market type classifier + reality check ──────────────────────────────────
+
+def _classify_market_type(question: str, resolution_criteria: str = "") -> dict:
+    """
+    Detect if a market is asking about a real-world price threshold so we can
+    fetch the actual current price and inject it into the Claude prompt.
+    Returns dict: {type, te_key, unit, threshold, direction, keyword}
+    """
+    import re as _re
+    combined = (question + " " + resolution_criteria).lower()
+
+    commodity_map = {
+        "methanol":      ("methanol",           "CNY/T"),
+        "crude oil":     ("crude-oil",           "USD/bbl"),
+        "brent":         ("brent-crude-oil",     "USD/bbl"),
+        "natural gas":   ("natural-gas",         "USD/MMBtu"),
+        "gold":          ("gold",                "USD/oz"),
+        "silver":        ("silver",              "USD/oz"),
+        "copper":        ("copper",              "USD/lb"),
+        "wheat":         ("wheat",               "USD/bushel"),
+        "corn":          ("corn",                "USD/bushel"),
+        "soybeans":      ("soybeans",            "USD/bushel"),
+        "cotton":        ("cotton",              "USD/lb"),
+        "coffee":        ("coffee",              "USD/lb"),
+        "sugar":         ("sugar",               "USD/lb"),
+        "bitcoin":       ("bitcoin",             "USD"),
+        "btc":           ("bitcoin",             "USD"),
+        "ethereum":      ("ethereum",            "USD"),
+        "eth":           ("ethereum",            "USD"),
+        "s&p 500":       ("sp500",               "USD"),
+        "s&p500":        ("sp500",               "USD"),
+        "nasdaq":        ("nasdaq100",           "USD"),
+        "dow jones":     ("dow-jones",           "USD"),
+        "eur/usd":       ("eurusd",              "USD"),
+    }
+
+    price_kw = {"price", "above", "below", "over", "under", "exceed",
+                "reach", "hit", "higher", "lower", "greater", "less"}
+
+    for keyword, (te_key, unit) in commodity_map.items():
+        if keyword in combined and any(w in combined for w in price_kw):
+            # Extract threshold number
+            threshold = None
+            numbers = _re.findall(r'[\$¥€]?\s*(\d[\d,\.]*)\s*(?:k\b)?', combined)
+            for n in numbers:
+                try:
+                    val = float(n.replace(",", ""))
+                    if val > 10:
+                        threshold = val
+                        break
+                except Exception:
+                    pass
+
+            direction = None
+            if any(w in combined for w in ("above", "over", "exceed", "higher", "greater")):
+                direction = "ABOVE"
+            elif any(w in combined for w in ("below", "under", "lower", "less")):
+                direction = "BELOW"
+
+            return {"type": "PRICE_THRESHOLD", "te_key": te_key, "unit": unit,
+                    "threshold": threshold, "direction": direction, "keyword": keyword}
+
+    econ_kw = {"gdp", "inflation", "cpi", "unemployment", "interest rate",
+               "fed funds", "federal reserve", "rate hike", "rate cut",
+               "nonfarm payroll", "payroll", "pce"}
+    for kw in econ_kw:
+        if kw in combined:
+            return {"type": "ECONOMIC_DATA", "te_key": None, "unit": None,
+                    "threshold": None, "direction": None, "keyword": kw}
+
+    return {"type": "GENERAL", "te_key": None, "unit": None,
+            "threshold": None, "direction": None, "keyword": None}
+
+
+def _try_fetch_commodity_price(market_type_info: dict) -> dict:
+    """
+    Fetch current real-world price for PRICE_THRESHOLD markets.
+    Tries CoinGecko for crypto, Trading Economics scrape for commodities.
+    Returns dict: {price, unit, source, found, summary}
+    """
+    result = {"price": None, "unit": None, "source": None, "found": False, "summary": ""}
+    if market_type_info.get("type") != "PRICE_THRESHOLD":
+        return result
+
+    te_key  = market_type_info.get("te_key", "")
+    unit    = market_type_info.get("unit", "")
+    keyword = market_type_info.get("keyword", "")
+
+    # CoinGecko for crypto (free, no auth)
+    crypto_map = {"bitcoin": "bitcoin", "btc": "bitcoin",
+                  "ethereum": "ethereum", "eth": "ethereum"}
+    if keyword in crypto_map:
+        try:
+            coin_id = crypto_map[keyword]
+            r = requests.get(f"{COINGECKO_BASE}/simple/price",
+                             params={"ids": coin_id, "vs_currencies": "usd"}, timeout=8)
+            price = float(r.json().get(coin_id, {}).get("usd", 0))
+            if price > 0:
+                result.update({"price": price, "unit": "USD", "source": "CoinGecko",
+                                "found": True,
+                                "summary": f"{keyword.title()} = ${price:,.2f} USD (CoinGecko)"})
+                return result
+        except Exception as e:
+            logger.debug(f"CoinGecko fetch failed for {keyword}: {e}")
+
+    # Trading Economics scrape for commodities
+    if te_key:
+        try:
+            url = f"https://tradingeconomics.com/commodity/{te_key}"
+            headers = {"User-Agent": "Mozilla/5.0 (compatible; research-bot/1.0)",
+                       "Accept": "text/html"}
+            r = requests.get(url, headers=headers, timeout=10)
+            if r.status_code == 200:
+                import re as _re
+                # TE embeds current price as JSON in script tags
+                matches = _re.findall(r'"price":\s*([\d,\.]+)', r.text)
+                for m in matches:
+                    try:
+                        val = float(m.replace(",", ""))
+                        if val > 0.01:
+                            result.update({
+                                "price": val, "unit": unit, "source": "Trading Economics",
+                                "found": True,
+                                "summary": f"{keyword.title()} = {val:,.2f} {unit} (Trading Economics)"
+                            })
+                            return result
+                    except Exception:
+                        pass
+        except Exception as e:
+            logger.debug(f"Trading Economics fetch failed for {te_key}: {e}")
+
+    return result
+
+
+def _analyze_failed_paper_trade(trade: dict):
+    """
+    Post-mortem analysis for a resolved LOSS paper trade using Claude Haiku.
+    Attaches a 'postmortem' dict to the trade record in-place.
+    """
+    try:
+        question   = trade.get("identifier", "")[:200]
+        direction  = trade.get("direction", "")
+        entry      = trade.get("price_at_signal", 0)
+        exit_price = trade.get("exit_price", 0)
+        true_prob  = trade.get("true_prob_est", 0)
+        research   = trade.get("research", "")
+
+        prompt = (
+            f"You are analysing a failed prediction market paper trade.\n\n"
+            f"MARKET: {question}\n"
+            f"DIRECTION: {direction}\n"
+            f"ENTRY: ${entry:.3f} ({entry*100:.0f}% implied probability)\n"
+            f"EXIT: ${exit_price:.3f} — LOSS\n"
+            f"ESTIMATED TRUE PROBABILITY: {true_prob:.0f}%\n"
+            f"RESEARCH SUMMARY: {research}\n\n"
+            f"In 2-3 sentences explain:\n"
+            f"1. Most likely reason this trade lost.\n"
+            f"2. What data should have overridden the recommendation.\n"
+            f"3. One rule to add to prevent similar losses.\n\n"
+            f'Reply ONLY as JSON: {{"failure_reason":"...","missed_signal":"...","rule_to_add":"...","category":"PRICE_CHECK|RESOLUTION_AMBIGUITY|LOW_EDGE|TIMING|BASE_RATE_ERROR|OTHER"}}'
+        )
+
+        resp = _claude_call(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=300,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        result_text = "".join(b.text for b in resp.content if hasattr(b, "text"))
+
+        import json as _json, re as _re
+        match = _re.search(r'\{[\s\S]*\}', result_text)
+        if match:
+            analysis = _json.loads(match.group())
+            trade["postmortem"] = analysis
+            logger.info(
+                f"Post-mortem '{question[:40]}': {analysis.get('failure_reason','')[:80]}"
+            )
+    except Exception as e:
+        logger.warning(f"Post-mortem analysis failed: {e}")
+
+
 def research_market(question: str, current_yes_price: float,
                     target_side: str, potential_return: float,
                     expires_at: str = "", known_poly_price: float = None,
                     known_manifold_price: float = None,
                     known_metaculus_prob: float = None,
-                    known_kalshi_price: float = None) -> dict:
+                    known_kalshi_price: float = None,
+                    resolution_criteria: str = "") -> dict:
     """
     Single-call research pipeline per market.
     Gated by daily API budget cap — set MAX_RESEARCH_CALLS_PER_DAY env var.
@@ -1832,6 +2017,81 @@ def research_market(question: str, current_yes_price: float,
 
         entry_price   = current_yes_price if target_side == "YES" else 1.0 - current_yes_price
         min_true_prob = entry_price * 100 + min_edge_pp
+
+        # ---- Reality check: fetch actual price for PRICE_THRESHOLD markets ---- #
+        reality_check_block = ""
+        market_type_info = _classify_market_type(question, resolution_criteria)
+        if market_type_info["type"] == "PRICE_THRESHOLD":
+            real_data = _try_fetch_commodity_price(market_type_info)
+            threshold = market_type_info.get("threshold")
+            direction = market_type_info.get("direction")
+            unit      = market_type_info.get("unit", "")
+            keyword   = market_type_info.get("keyword", "")
+
+            if real_data["found"] and real_data["price"]:
+                current_val = real_data["price"]
+                source      = real_data["source"]
+                already_met = (
+                    (direction == "ABOVE" and threshold and current_val > threshold) or
+                    (direction == "BELOW" and threshold and current_val < threshold)
+                )
+                logger.info(
+                    f"Reality check: {keyword} = {current_val:,.2f} {unit} "
+                    f"(threshold={threshold}, direction={direction}, met={already_met}) "
+                    f"via {source}"
+                )
+
+                status_line = (
+                    f"CURRENTLY {'ABOVE' if direction == 'ABOVE' and already_met else 'BELOW' if direction == 'BELOW' and already_met else 'NOT YET AT'} THRESHOLD"
+                    if threshold else f"CURRENT VALUE: {current_val:,.2f} {unit}"
+                )
+                reality_check_block = (
+                    f"⚠️ REALITY CHECK — ACTUAL MARKET DATA (verified, not prediction prices):\n"
+                    f"  Source: {source}\n"
+                    f"  {real_data['summary']}\n"
+                    f"  Threshold in question: {threshold:,.0f} {unit} {direction or ''}\n"
+                    f"  Status: {status_line}\n"
+                    f"  → This REAL PRICE must be the PRIMARY input to your probability estimate.\n"
+                    f"  → Do NOT rely on prediction market prices if actual data is available.\n\n"
+                )
+
+                # Fast path: if market expires <24h and data definitively answers it, skip Claude
+                if hours_left is not None and hours_left < 24 and threshold and direction:
+                    confidence = "HIGH" if already_met else "HIGH"  # definitive either way
+                    true_prob_fast = 90.0 if already_met else 10.0
+                    recommendation = f"BUY {target_side}" if (
+                        (already_met and target_side == "YES") or
+                        (not already_met and target_side == "NO")
+                    ) else "SKIP"
+                    logger.info(
+                        f"Fast path: {keyword} market expires in {hours_left:.1f}h, "
+                        f"real price {'meets' if already_met else 'does not meet'} threshold "
+                        f"→ {recommendation}"
+                    )
+                    _last_research_end = time.time()
+                    result = {
+                        "true_prob":      true_prob_fast,
+                        "edge_pp":        str(round(true_prob_fast - entry_price * 100, 1)),
+                        "edge_size":      "LARGE" if abs(true_prob_fast - entry_price * 100) > 20 else "MEDIUM",
+                        "key_finding":    f"Real price {current_val:,.2f} {unit} via {source} — threshold {'already met' if already_met else 'not met'} with {hours_left:.1f}h left",
+                        "base_rate":      "ACTUAL_DATA",
+                        "cross_market":   "not_needed",
+                        "resolution_clarity": "CLEAR",
+                        "recommendation": recommendation,
+                        "confidence":     confidence,
+                        "reasoning":      real_data["summary"],
+                        "kelly_stake":    kelly_criterion(true_prob_fast, entry_price),
+                        "hours_left":     hours_left,
+                        "raw":            reality_check_block,
+                        "reality_check":  real_data,
+                    }
+                    _cache_research(str(hash(question)), result)
+                    return result
+            else:
+                reality_check_block = (
+                    f"⚠️ REALITY CHECK ATTEMPTED — price fetch failed for '{keyword}'.\n"
+                    f"  → Search for the current actual {keyword} price ({unit}) as your first priority.\n\n"
+                )
 
         # Build known external prices block — reduces searches needed
         known_prices = []
@@ -1895,6 +2155,7 @@ def research_market(question: str, current_yes_price: float,
             f"MYRIAD: YES=${current_yes_price:.2f} ({current_yes_price*100:.0f}% implied)\n"
             f"TARGET: BUY {target_side} @ ${entry_price:.2f} = {potential_return:.1f}x return\n"
             f"{time_context}\n"
+            f"{reality_check_block}"
             f"{known_prices_context}"
             + search_block +
             f"Estimate probability by reasoning in this order:\n"
@@ -1961,6 +2222,7 @@ def research_market(question: str, current_yes_price: float,
             "kelly_stake":        kelly_stake,
             "hours_left":         hours_left,
             "raw":                result_text[:300],
+            "reality_check":      market_type_info,
         }
 
     except Exception as e:
