@@ -46,11 +46,31 @@ WHALE_MIN_TRADE_USD = float(os.environ.get("WHALE_MIN_TRADE_USD", "500"))
 # Minimum whale historical win rate to include in tracking
 WHALE_MIN_WIN_RATE = float(os.environ.get("WHALE_MIN_WIN_RATE", "0.60"))
 
-# Seed wallet list — known high-ROI Polymarket addresses.
+# Seed wallet list — verified high-ROI Polymarket addresses (Polygon network).
+# Sources: polymarket.com/leaderboard, predicts.guru, polytrackhq.app
 # Add more via WHALE_WALLETS env var (comma-separated addresses).
 _DEFAULT_WHALES = [
-    "0x8fe9f1f76a2804ee9c5f1c0c9b0e8d8f1e5b0d34",  # placeholder — replace with real addresses
-    "0x3a4e2f9c8b7d6e1f0a5c2b9d8e7f6c5a4b3d2e1f",  # placeholder
+    # ── All-time profit leaderboard ──────────────────────────────────────
+    "0x56687bf447db6ffa42ffe2204a05edaa20f55839",  # Theo4       — $22M PnL, election specialist
+    "0x1f2dd6d473f3e824cd2f8a89d9c69fb96f6ad0cf",  # Fredi9999   — $16.6M PnL, 45 markets
+    "0x6a72f61820b26b1fe4d956e17b6dc2a1ea3033ee",  # kch123      — 61% WR, 74.9% ROI, 2932 trades
+    "0x78b9ac44a6d7d7a076c14e0ad518b301b63c6b76",  # Len9311238  — $8.7M PnL
+    "0xd235973291b2b75ff4070e9c0b01728c520b0f29",  # zxgngl      — $7.8M PnL
+    "0x863134d00841b2e200492805a01e1e2f5defaa53",  # RepTrump    — $7.5M PnL
+    "0x2005d16a84ceefa912d4e380cd32e7ff827875ea",  # RN1         — $6.5M PnL, high volume
+    "0x8119010a6e589062aa03583bb3f39ca632d9f887",  # PrincessCaro — $6.1M PnL
+    "0xe9ad918c7678cd38b12603a762e638a5d1ee7091",  # walletmobile — $5.9M PnL
+    "0x94f199fb7789f1aef7fff6b758d6b375100f4c7a",  # KeyTransporter — $5.7M PnL
+
+    # ── Monthly leaderboard top performers ──────────────────────────────
+    "0x492442eab586f242b53bda933fd5de859c8a3782",  # #1 monthly  — $4.2M monthly PnL
+    "0x02227b8f5a9636e895607edd3185ed6ee5598ff7",  # HorizonSplendidView — $4M monthly
+    "0xc2e7800b5af46e6093872b177b7a5e7f0563be51",  # beachboy4   — $3.76M monthly
+    "0xefbc5fec8d7b0acdc8911bdd9a98d6964308f9a2",  # reachingthesky — $3.74M monthly
+    "0x019782cab5d844f02bafb71f512758be78579f3c",  # majorexploiter — $2.4M monthly
+
+    # ── High win-rate specialist ─────────────────────────────────────────
+    "0x4e25605fd905e9972efc0f4d8814530c655cd7a7",  # polyburg #7 — 79.8% WR
 ]
 
 # In-memory dedup: set of (wallet, market_id, direction) already seen this session
