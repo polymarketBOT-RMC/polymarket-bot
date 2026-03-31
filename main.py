@@ -11,6 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 from flask import Flask, request, render_template_string
 from apscheduler.schedulers.blocking import BlockingScheduler
 from waitress import serve
+from whale_tracker import get_whale_signals, reset_whale_dedup
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -3346,12 +3347,124 @@ def check_gap_exits():
 
 _last_cycle_time: str = "never"
 
+def _whale_contradicts_position(sig: dict, open_trades: list) -> dict:
+    """
+    Check if a whale signal contradicts one of our open paper trades.
+    Returns the conflicting trade dict or None.
+    Contradiction: whale buys YES on a market where we hold NO (or vice versa).
+    """
+    sig_id   = sig.get("market_id", "") or sig.get("identifier", "")
+    sig_side = "YES" if "YES" in sig.get("direction", "").upper() else "NO"
+
+    for trade in open_trades:
+        if trade.get("resolved"):
+            continue
+        t_id   = trade.get("market_id", "") or trade.get("identifier", "")
+        t_side = "YES" if "YES" in trade.get("direction", "").upper() else "NO"
+
+        # Match by market_id or similar identifier
+        id_match = (sig_id and t_id and sig_id == t_id) or (
+            sig.get("identifier", "")[:40].lower() ==
+            trade.get("identifier", "")[:40].lower()
+        )
+
+        if id_match and sig_side != t_side:
+            return trade  # contradiction found
+
+    return None
+
+
+def run_whale_cycle():
+    """
+    Run whale tracker and log any new signals as paper trades.
+    Also checks if whale trades contradict our open positions — if so,
+    sends a warning email instead of copying the trade.
+    """
+    try:
+        signals = get_whale_signals()
+        if not signals:
+            return
+
+        open_trades = [
+            h for h in load_history()
+            if h.get("type") == "paper_trade" and not h.get("resolved")
+        ]
+
+        for sig in signals:
+            if sig.get("confidence") == "LOW":
+                logger.info(
+                    f"🐋 Whale LOW confidence — skipping: {sig['identifier'][:50]}"
+                )
+                continue
+
+            # Check for contradiction with our open positions
+            conflict = _whale_contradicts_position(sig, open_trades)
+            if conflict:
+                logger.warning(
+                    f"🐋⚠️ Whale CONTRADICTS our position: {sig['identifier'][:50]} — "
+                    f"whale bought {sig['direction']}, we hold {conflict.get('direction')}"
+                )
+                subject = (
+                    f"⚠️ Whale contradicts our position: {sig['identifier'][:55]}"
+                )
+                body = (
+                    f"A high-ROI whale just traded AGAINST our open position.\n\n"
+                    f"Market: {sig['identifier']}\n"
+                    f"Our position: {conflict.get('direction')} "
+                    f"@ ${conflict.get('price_at_signal', 0):.3f}\n"
+                    f"Whale trade: {sig['direction']} @ ${sig['price']:.3f}\n"
+                    f"Whale size: ${sig['trade_size_usd']:.0f}\n"
+                    f"Whale win rate: {sig['whale_win_rate']:.0%}\n"
+                    f"Confidence: {sig['confidence']}\n\n"
+                    f"Consider reviewing this position."
+                )
+                try:
+                    send_email(subject, body)
+                except Exception:
+                    pass
+                continue  # don't copy a trade that contradicts us
+
+            # No conflict — copy the trade
+            log_signal(
+                identifier=sig["identifier"],
+                signal_type="whale_copy",
+                direction=sig["direction"],
+                price=sig["price"],
+                market_type="WHALE_COPY",
+                market_id=sig.get("market_id", ""),
+                true_prob=sig.get("true_prob", 0),
+                research_summary=sig.get("reason", ""),
+            )
+
+            if sig.get("confidence") == "HIGH":
+                subject = f"🐋 HIGH confidence whale copy: {sig['identifier'][:60]}"
+                body = (
+                    f"Whale address: {sig['whale_address'][:12]}…\n"
+                    f"Market: {sig['identifier']}\n"
+                    f"Direction: {sig['direction']} @ ${sig['price']:.3f}\n"
+                    f"Trade size: ${sig['trade_size_usd']:.0f}\n"
+                    f"Whale win rate: {sig['whale_win_rate']:.0%}\n"
+                    f"Confidence: {sig['confidence']}\n"
+                )
+                try:
+                    send_email(subject, body)
+                except Exception:
+                    pass
+
+    except Exception as e:
+        logger.error(f"Whale cycle error: {e}")
+
+
 def run_myriad_cycle():
     global _last_cycle_time
     logger.info("── Myriad cycle starting ──")
     prune_dedup_cache()
     check_gap_exits()   # check if any open positions' gaps have closed
     check_myriad_positions()
+
+    # Whale tracker — runs every cycle alongside normal market scanning
+    run_whale_cycle()
+
     thin_markets, liquid_markets = get_myriad_markets()
     if not thin_markets and not liquid_markets:
         logger.info("No valid Myriad markets found.")
@@ -4096,6 +4209,7 @@ if __name__ == "__main__":
     scheduler.add_job(check_paper_trade_outcomes, "interval", hours=4)
     scheduler.add_job(lambda: check_paper_trade_outcomes(force_email=True),
                       "cron", day_of_week="mon,thu", hour=8, minute=0)  # Mon+Thu 8am UTC = 3pm Bangkok
+    scheduler.add_job(reset_whale_dedup,              "cron", hour=0,  minute=0)   # midnight UTC — allow re-alerts
     scheduler.add_job(send_health_check,               "cron", hour=1,  minute=0)   # 08:00 Bangkok
     scheduler.add_job(lambda: send_report("daily"),   "cron", hour=23, minute=0)
     scheduler.add_job(lambda: send_report("weekly"),  "cron", day_of_week="mon", hour=23, minute=30)
