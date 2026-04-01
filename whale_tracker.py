@@ -349,7 +349,7 @@ def get_whale_signals() -> list:
     if signals:
         logger.info(f"🐋 Whale tracker: {len(signals)} signal(s) this cycle")
     else:
-        logger.debug("🐋 Whale tracker: no new signals this cycle")
+        logger.info("🐋 Whale tracker: no new signals this cycle")
 
     return signals
 

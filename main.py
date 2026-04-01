@@ -3414,7 +3414,7 @@ def run_whale_cycle():
                     f"@ ${conflict.get('price_at_signal', 0):.3f}\n"
                     f"Whale trade: {sig['direction']} @ ${sig['price']:.3f}\n"
                     f"Whale size: ${sig['trade_size_usd']:.0f}\n"
-                    f"Whale win rate: {sig['whale_win_rate']:.0%}\n"
+                    f"Whale win rate: {sig['whale_wr']:.0%}\n"
                     f"Confidence: {sig['confidence']}\n\n"
                     f"Consider reviewing this position."
                 )
@@ -3443,7 +3443,7 @@ def run_whale_cycle():
                     f"Market: {sig['identifier']}\n"
                     f"Direction: {sig['direction']} @ ${sig['price']:.3f}\n"
                     f"Trade size: ${sig['trade_size_usd']:.0f}\n"
-                    f"Whale win rate: {sig['whale_win_rate']:.0%}\n"
+                    f"Whale win rate: {sig['whale_wr']:.0%}\n"
                     f"Confidence: {sig['confidence']}\n"
                 )
                 try:
