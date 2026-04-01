@@ -385,7 +385,8 @@ def check_paper_trade_outcomes(force_email=False):
                             win = (yes_price >= 0.99 and "YES" in direction.upper()) or                                   (yes_price <= 0.01 and "NO" in direction.upper())
                             item["resolved"]    = True
                             item["exit_price"]  = 1.0 if win else 0.0
-                            item["pnl_dollar"]  = round(stake * (1.0/entry - 1) if win else -stake, 2)
+                            raw_pnl = stake * (1.0/entry - 1) if win else -stake
+                            item["pnl_dollar"]  = round(min(raw_pnl, stake * 50), 2)  # cap at 50x stake
                             item["pnl_pct"]     = round((item["pnl_dollar"] / stake) * 100, 1)
                             item["outcome"]     = "WIN" if win else "LOSS"
                             resolved.append(item)
@@ -1720,6 +1721,7 @@ def build_myriad_summary(markets, max_markets=15):
 
 MIN_RETURN_MULTIPLIER = 2.3   # only alert if potential return >= 2.3x
 MAX_BUY_PRICE         = 1 / MIN_RETURN_MULTIPLIER  # = $0.435
+MIN_BUY_PRICE         = 0.03  # 3 cents min — below 3% probability is lottery territory, not edge
 
 def prefilter_for_value(markets: list) -> list:
     """
@@ -1739,13 +1741,13 @@ def prefilter_for_value(markets: list) -> list:
                     yes_price = price
                 elif title in ("NO", "FALSE"):
                     no_price = price
-            # Check if either side offers 2.3x potential
-            if yes_price and yes_price <= MAX_BUY_PRICE:
+            # Check if either side offers 2.3x potential and is above minimum price floor
+            if yes_price and MIN_BUY_PRICE <= yes_price <= MAX_BUY_PRICE:
                 m["_target_side"]  = "YES"
                 m["_entry_price"]  = yes_price
                 m["_potential_return"] = round(1.0 / yes_price, 2)
                 candidates.append(m)
-            elif no_price and no_price <= MAX_BUY_PRICE:
+            elif no_price and MIN_BUY_PRICE <= no_price <= MAX_BUY_PRICE:
                 m["_target_side"]  = "NO"
                 m["_entry_price"]  = no_price
                 m["_potential_return"] = round(1.0 / no_price, 2)
