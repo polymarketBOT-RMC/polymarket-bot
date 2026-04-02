@@ -1039,6 +1039,34 @@ def close_trade():
     return render_template_string(FORM_HTML, success=False, close_success=True,
                                   positions=remaining, prefill_market="", prefill_ticker="")
 
+@app.route("/void_trade", methods=["GET"])
+def void_paper_trade():
+    """
+    Manually void open paper trades by partial name match.
+    Usage: /void_trade?q=methanol  — voids all open trades containing 'methanol'
+    Marks as resolved LOSS so they don't skew the win rate.
+    """
+    q = request.args.get("q", "").lower().strip()
+    if not q:
+        return "<p>Usage: /void_trade?q=part_of_market_name</p>", 400
+    history = load_history()
+    voided = []
+    for item in history:
+        if item.get("type") != "paper_trade" or item.get("resolved"):
+            continue
+        if q in item.get("identifier", "").lower():
+            item["resolved"]   = True
+            item["outcome"]    = "VOID"
+            item["exit_price"] = 0.0
+            item["pnl_dollar"] = 0.0
+            item["pnl_pct"]    = 0.0
+            voided.append(item.get("identifier", "")[:60])
+    save_history(history)
+    if voided:
+        return f"<p>Voided {len(voided)} trade(s):<br>" + "<br>".join(voided) + "</p>"
+    return f"<p>No open trades found matching '{q}'</p>", 404
+
+
 @app.route("/delete", methods=["POST"])
 def delete_position():
     pos_id    = request.form.get("pos_id", "")
