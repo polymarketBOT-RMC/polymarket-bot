@@ -44,23 +44,30 @@ app    = Flask(__name__)
 def _claude_call(**kwargs):
     """
     Wrapper around client.messages.create with retry logic for transient errors:
-    - 429 rate_limit_error: wait 75s (rolling token window clears) then retry once
-    - 529 overloaded_error: wait 60s (server-side overload) then retry once
+    - 429 rate_limit_error: wait 75s (rolling token window clears) then retry
+    - 529 overloaded_error: exponential backoff — 60s, 120s, 240s, 480s, 600s
     All other errors propagate immediately.
     """
-    try:
-        return client.messages.create(**kwargs)
-    except Exception as e:
-        err = str(e)
-        if "429" in err or "rate_limit" in err.lower():
-            logger.warning(f"Rate limit 429 — sleeping 75s then retrying")
-            time.sleep(75)
-        elif "529" in err or "overloaded" in err.lower():
-            logger.warning(f"Anthropic overloaded 529 — sleeping 60s then retrying")
-            time.sleep(60)
-        else:
-            raise
-        return client.messages.create(**kwargs)  # second attempt — raises if still failing
+    MAX_RETRIES = 5
+    wait = 60
+    for attempt in range(MAX_RETRIES):
+        try:
+            return client.messages.create(**kwargs)
+        except Exception as e:
+            err = str(e)
+            if "429" in err or "rate_limit" in err.lower():
+                sleep_time = 75
+                logger.warning(f"Rate limit 429 (attempt {attempt+1}/{MAX_RETRIES}) — sleeping {sleep_time}s")
+            elif "529" in err or "overloaded" in err.lower():
+                sleep_time = wait
+                wait = min(wait * 2, 600)
+                logger.warning(f"Anthropic overloaded 529 (attempt {attempt+1}/{MAX_RETRIES}) — sleeping {sleep_time}s")
+            else:
+                raise
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(sleep_time)
+            else:
+                raise
 
 MYRIAD_API          = "https://api-v2.myriadprotocol.com"
 AV_BASE             = "https://www.alphavantage.co/query"
